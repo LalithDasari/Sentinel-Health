@@ -9,10 +9,30 @@
     <meta property="og:description" content="AI-powered medical lab report translator for patients and real-time epidemiological symptom surveillance heatmap dashboard." />
     <meta property="og:type" content="website" />
     <meta name="twitter:card" content="summary_large_image" />
+    
+    <!-- PWA Meta & Icons -->
+    <meta name="theme-color" content="#0f172a" />
+    <meta name="mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="default" />
+    <meta name="apple-mobile-web-app-title" content="Sentinel" />
+    <link rel="manifest" href="/manifest.json" />
+    <link rel="apple-touch-icon" href="/icon-192.png" />
+    <link rel="icon" type="image/svg+xml" href="/icon.svg" />
+    
     <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
   </head>
   <body class="bg-slate-50 text-slate-900 antialiased selection:bg-teal-500 selection:text-white">
     <div id="root"></div>
     <script type="module" src="/src/main.tsx"></script>
+    <script>
+      if ('serviceWorker' in navigator && window.location.protocol.startsWith('http')) {
+        window.addEventListener('load', () => {
+          navigator.serviceWorker.register('/sw.js').catch((err) => {
+            console.warn('SW registration info:', err);
+          });
+        });
+      }
+    </script>
   </body>
 </html>

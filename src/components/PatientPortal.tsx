@@ -7,28 +7,44 @@ import {
   MapPin,
   AlertCircle,
   CheckCircle2,
-  HelpCircle,
   HeartPulse,
   Volume2,
   VolumeX,
   ArrowRight,
   RefreshCw,
-  Eye,
   X,
-  Stethoscope,
   ShieldCheck,
   ChevronRight,
   MessageSquare,
-  FileText
+  FileText,
+  Lock,
+  WifiOff,
+  Languages,
+  Check
 } from 'lucide-react';
 import { getPincodeLocation } from '../lib/pincodeData';
 import { SAMPLE_LAB_REPORTS, SampleReportOption } from '../lib/sampleReports';
 import { SymptomReportItem, saveSymptomReportToFirestore } from '../lib/firebase';
 import { SymptomChat } from './SymptomChat';
+import {
+  SupportedLanguage,
+  SUPPORTED_LANGUAGES,
+  getTranslation,
+} from '../lib/i18n';
+import { scrubPiiFromImagePayload, PiiScrubResult } from '../lib/piiScrubber';
+import {
+  enqueueOfflineReport,
+  getQueuedReports,
+  flushOfflineQueue,
+  subscribeToQueueUpdates
+} from '../lib/offlineQueue';
 
 interface PatientPortalProps {
   onNavigateToDashboard: (highlightPincode?: string) => void;
   onReportProcessed?: (report: SymptomReportItem) => void;
+  language?: SupportedLanguage;
+  onLanguageChange?: (lang: SupportedLanguage) => void;
+  isHighContrast?: boolean;
 }
 
 interface KeyFinding {
@@ -56,6 +72,9 @@ interface TranslatedExplanation {
 export const PatientPortal: React.FC<PatientPortalProps> = ({
   onNavigateToDashboard,
   onReportProcessed,
+  language = 'en',
+  onLanguageChange,
+  isHighContrast = false,
 }) => {
   const [activeTab, setActiveTab] = useState<'scanner' | 'chat'>('scanner');
   const [selectedImage, setSelectedImage] = useState<string | null>(null);
@@ -69,12 +88,49 @@ export const PatientPortal: React.FC<PatientPortalProps> = ({
   const [isPlayingAudio, setIsPlayingAudio] = useState<boolean>(false);
   const [selectedSample, setSelectedSample] = useState<string | null>(null);
 
+  // Security & Offline states
+  const [piiScrubStats, setPiiScrubStats] = useState<{
+    redactedCount: number;
+    types: string[];
+  } | null>(null);
+  const [isOfflineQueued, setIsOfflineQueued] = useState<boolean>(false);
+  const [pendingQueueCount, setPendingQueueCount] = useState<number>(() => getQueuedReports().length);
+
   const fileInputRef = useRef<HTMLInputElement>(null);
   const cameraInputRef = useRef<HTMLInputElement>(null);
   const resultsRef = useRef<HTMLDivElement>(null);
 
   // Auto-derived location for the entered pincode
   const pincodeInfo = pincode.length === 6 ? getPincodeLocation(pincode) : null;
+
+  // Listen to offline queue updates and auto-flush on reconnection
+  useEffect(() => {
+    const updateCount = () => {
+      setPendingQueueCount(getQueuedReports().length);
+    };
+
+    const unsubscribeQueue = subscribeToQueueUpdates(updateCount);
+
+    const handleOnline = async () => {
+      const processed = await flushOfflineQueue((jobId, data) => {
+        if (data.explanation) {
+          setExplanation(data.explanation);
+          setSavedDocId(data.docId || 'synced-from-offline');
+        }
+      });
+      if (processed > 0) {
+        setIsOfflineQueued(false);
+      }
+      updateCount();
+    };
+
+    window.addEventListener('online', handleOnline);
+
+    return () => {
+      unsubscribeQueue();
+      window.removeEventListener('online', handleOnline);
+    };
+  }, []);
 
   // Multi-step loading messages
   useEffect(() => {
@@ -101,7 +157,7 @@ export const PatientPortal: React.FC<PatientPortalProps> = ({
     const file = e.target.files?.[0];
     if (file) {
       if (!file.type.startsWith('image/') && !file.type.includes('pdf')) {
-        setErrorMessage('Please upload an image file (JPG, PNG, WebP).');
+        setErrorMessage('Please upload a valid image file (JPG, PNG, WebP).');
         return;
       }
       setErrorMessage(null);
@@ -110,24 +166,38 @@ export const PatientPortal: React.FC<PatientPortalProps> = ({
 
       const reader = new FileReader();
       reader.onload = () => {
-        setSelectedImage(reader.result as string);
+        const rawPayload = reader.result as string;
+        // Edge-side PII scrubbing immediately upon file selection
+        const scrubbed = scrubPiiFromImagePayload(rawPayload);
+        setSelectedImage(scrubbed.scrubbedImage);
+        setPiiScrubStats({
+          redactedCount: scrubbed.redactedCount,
+          types: scrubbed.detectedTypes,
+        });
       };
       reader.readAsDataURL(file);
     }
   };
 
   const handleSelectSample = (sample: SampleReportOption) => {
-    setSelectedImage(sample.imageDataUrl);
+    // Edge-side PII scrub sample report payload
+    const scrubbed = scrubPiiFromImagePayload(sample.imageDataUrl);
+    setSelectedImage(scrubbed.scrubbedImage);
     setImageFileName(`${sample.title}.svg`);
     setPincode(sample.pincode);
     setSelectedSample(sample.id);
     setErrorMessage(null);
+    setPiiScrubStats({
+      redactedCount: scrubbed.redactedCount,
+      types: scrubbed.detectedTypes,
+    });
   };
 
   const handleClearImage = () => {
     setSelectedImage(null);
     setImageFileName('');
     setSelectedSample(null);
+    setPiiScrubStats(null);
     if (fileInputRef.current) fileInputRef.current.value = '';
     if (cameraInputRef.current) cameraInputRef.current.value = '';
   };
@@ -140,14 +210,27 @@ export const PatientPortal: React.FC<PatientPortalProps> = ({
     }
 
     const cleanPincode = pincode.replace(/\D/g, '').slice(0, 6);
-    if (cleanPincode.length !== 6) {
-      setErrorMessage('Please enter a valid 6-digit postal code (PIN code).');
+    if (!/^[1-9][0-9]{5}$/.test(cleanPincode)) {
+      setErrorMessage('Please enter a valid 6-digit Indian postal PIN code.');
       return;
     }
 
     setLoading(true);
     setErrorMessage(null);
     setExplanation(null);
+    setIsOfflineQueued(false);
+
+    // If client is offline, queue request locally for PWA auto-sync
+    if (typeof navigator !== 'undefined' && !navigator.onLine) {
+      enqueueOfflineReport({
+        image: selectedImage,
+        pincode: cleanPincode,
+        targetLanguage: language,
+      });
+      setLoading(false);
+      setIsOfflineQueued(true);
+      return;
+    }
 
     try {
       const response = await fetch('/api/analyze-report', {
@@ -156,6 +239,7 @@ export const PatientPortal: React.FC<PatientPortalProps> = ({
         body: JSON.stringify({
           image: selectedImage,
           pincode: cleanPincode,
+          targetLanguage: language,
         }),
       });
 
@@ -183,7 +267,7 @@ export const PatientPortal: React.FC<PatientPortalProps> = ({
       try {
         await saveSymptomReportToFirestore(surveillanceItem);
       } catch {
-        // Handled silently
+        // Silently handled if direct client SDK rule is strict
       }
 
       if (onReportProcessed) {
@@ -195,7 +279,19 @@ export const PatientPortal: React.FC<PatientPortalProps> = ({
       }, 150);
     } catch (err: any) {
       console.error('Translation error:', err);
-      setErrorMessage(err.message || 'An error occurred while analyzing the report. Please try again.');
+      // If network failure occurred, offer queueing
+      if (!navigator.onLine || err.message?.includes('Failed to fetch')) {
+        enqueueOfflineReport({
+          image: selectedImage,
+          pincode: cleanPincode,
+          targetLanguage: language,
+        });
+        setIsOfflineQueued(true);
+      } else {
+        setErrorMessage(
+          err.message || 'An error occurred while analyzing the report. Please try again.'
+        );
+      }
     } finally {
       setLoading(false);
     }
@@ -210,9 +306,15 @@ export const PatientPortal: React.FC<PatientPortalProps> = ({
       return;
     }
 
-    const textToRead = `${explanation.title}. Summary: ${explanation.summary}. What it means: ${explanation.whatItMeans}`;
+    const textToRead = `${explanation.title}. ${explanation.summary}. ${explanation.whatItMeans}`;
     const utterance = new SpeechSynthesisUtterance(textToRead);
-    utterance.rate = 0.95;
+
+    // Set voice language based on chosen translation language
+    const langOption = SUPPORTED_LANGUAGES.find((l) => l.code === language);
+    if (langOption) {
+      utterance.lang = langOption.voiceLang;
+    }
+    utterance.rate = 0.92;
     utterance.pitch = 1.0;
 
     utterance.onend = () => setIsPlayingAudio(false);
@@ -228,14 +330,14 @@ export const PatientPortal: React.FC<PatientPortalProps> = ({
         return (
           <span className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-bold bg-rose-100 text-rose-800 border border-rose-300">
             <span className="h-2 w-2 rounded-full bg-rose-600 animate-ping"></span>
-            Critical Attention Required
+            Critical Priority
           </span>
         );
       case 'high':
         return (
           <span className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-bold bg-orange-100 text-orange-800 border border-orange-300">
             <span className="h-2 w-2 rounded-full bg-orange-600"></span>
-            High Priority Finding
+            High Attention
           </span>
         );
       case 'moderate':
@@ -249,7 +351,7 @@ export const PatientPortal: React.FC<PatientPortalProps> = ({
         return (
           <span className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-bold bg-emerald-100 text-emerald-800 border border-emerald-300">
             <span className="h-2 w-2 rounded-full bg-emerald-600"></span>
-            Normal / Optimal Range
+            Optimal / Baseline
           </span>
         );
     }
@@ -269,591 +371,619 @@ export const PatientPortal: React.FC<PatientPortalProps> = ({
   };
 
   return (
-    <div className="min-h-screen bg-slate-50 py-8 px-4 sm:px-6 lg:px-8">
+    <div
+      className={`min-h-screen py-8 px-4 sm:px-6 lg:px-8 transition-colors duration-200 ${
+        isHighContrast ? 'bg-black text-white' : 'bg-slate-50 text-slate-900'
+      }`}
+    >
       <div className="max-w-3xl mx-auto space-y-6">
-        {/* Patient Portal Dual Tabs: Lab Report Scanner vs Symptom Chat */}
-        <div className="flex items-center justify-center">
-          <div className="inline-flex p-1.5 bg-slate-200/80 rounded-2xl border border-slate-300 shadow-sm w-full sm:w-auto">
+        {/* Offline Banner Notification */}
+        {isOfflineQueued && (
+          <div
+            role="status"
+            aria-live="polite"
+            className="rounded-2xl bg-amber-500/10 border-2 border-amber-500 p-4 text-amber-900 dark:text-amber-200 flex items-start gap-3 shadow-sm"
+          >
+            <WifiOff className="w-5 h-5 text-amber-600 flex-shrink-0 mt-0.5" />
+            <div className="space-y-1">
+              <h3 className="text-sm font-bold">Offline Queue Active</h3>
+              <p className="text-xs leading-relaxed">
+                {getTranslation(language, 'offlineQueued')}
+              </p>
+              <div className="flex items-center gap-2 pt-1">
+                <span className="text-[11px] font-semibold bg-amber-200/60 dark:bg-amber-900/40 px-2 py-0.5 rounded-full">
+                  1 job pending local sync
+                </span>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* Patient Portal Dual Tabs */}
+        <div className="flex items-center justify-between flex-wrap gap-3">
+          <div
+            role="tablist"
+            aria-label="Patient Portal Options"
+            className="inline-flex p-1.5 bg-slate-200/90 dark:bg-slate-800 rounded-2xl border border-slate-300 dark:border-slate-700 shadow-sm w-full sm:w-auto"
+          >
             <button
               type="button"
+              role="tab"
+              aria-selected={activeTab === 'scanner'}
+              aria-controls="scanner-panel"
               onClick={() => setActiveTab('scanner')}
               className={`flex-1 sm:flex-initial inline-flex items-center justify-center gap-2 px-5 py-2.5 rounded-xl text-xs sm:text-sm font-bold transition duration-150 ${
                 activeTab === 'scanner'
-                  ? 'bg-white text-teal-800 shadow-sm border border-slate-200'
-                  : 'text-slate-600 hover:text-slate-900'
+                  ? 'bg-white dark:bg-slate-900 text-teal-800 dark:text-teal-400 shadow-sm border border-slate-200 dark:border-slate-700'
+                  : 'text-slate-600 dark:text-slate-300 hover:text-slate-900 dark:hover:text-white'
               }`}
             >
-              <FileText className="w-4 h-4 text-teal-600" />
-              <span>Lab Report Scanner</span>
+              <FileText className="w-4 h-4 text-teal-600" aria-hidden="true" />
+              <span>{getTranslation(language, 'scannerTab')}</span>
             </button>
 
             <button
               type="button"
+              role="tab"
+              aria-selected={activeTab === 'chat'}
+              aria-controls="chat-panel"
               onClick={() => setActiveTab('chat')}
               className={`flex-1 sm:flex-initial inline-flex items-center justify-center gap-2 px-5 py-2.5 rounded-xl text-xs sm:text-sm font-bold transition duration-150 ${
                 activeTab === 'chat'
                   ? 'bg-slate-900 text-teal-400 shadow-sm border border-slate-800'
-                  : 'text-slate-600 hover:text-slate-900'
+                  : 'text-slate-600 dark:text-slate-300 hover:text-slate-900 dark:hover:text-white'
               }`}
             >
-              <MessageSquare className="w-4 h-4 text-teal-400" />
-              <span>Describe How You Feel</span>
-              <span className="px-1.5 py-0.2 rounded-full text-[10px] font-extrabold bg-teal-400/20 text-teal-600 border border-teal-500/30">
-                AI CHAT
+              <MessageSquare className="w-4 h-4 text-teal-400" aria-hidden="true" />
+              <span>{getTranslation(language, 'chatTab')}</span>
+              <span className="hidden sm:inline-block ml-1 px-1.5 py-0.2 rounded text-[10px] font-extrabold bg-teal-500/20 text-teal-300 border border-teal-500/30">
+                {getTranslation(language, 'aiAssistantBadge')}
               </span>
             </button>
           </div>
+
+          {/* Quick Language Selector inside Portal */}
+          {onLanguageChange && (
+            <div className="flex items-center gap-1.5 text-xs font-medium ml-auto">
+              <Languages className="w-4 h-4 text-teal-600" aria-hidden="true" />
+              <label htmlFor="portal-lang-select" className="text-slate-500 dark:text-slate-400 font-semibold">
+                {getTranslation(language, 'languageSelect')}:
+              </label>
+              <select
+                id="portal-lang-select"
+                value={language}
+                onChange={(e) => onLanguageChange(e.target.value as SupportedLanguage)}
+                className="bg-white dark:bg-slate-900 border border-slate-300 dark:border-slate-700 rounded-lg px-2.5 py-1 text-xs font-bold text-slate-800 dark:text-slate-100 shadow-xs cursor-pointer focus:ring-2 focus:ring-teal-500"
+              >
+                {SUPPORTED_LANGUAGES.map((l) => (
+                  <option key={l.code} value={l.code}>
+                    {l.nativeName} ({l.label})
+                  </option>
+                ))}
+              </select>
+            </div>
+          )}
         </div>
 
-        {/* Tab 2: Symptom Chat Interface */}
-        {activeTab === 'chat' ? (
-          <SymptomChat
-            pincode={pincode}
-            reportContext={
-              explanation
-                ? {
-                    title: explanation.title,
-                    summary: explanation.summary,
-                    symptom: explanation.symptom,
-                    keyFindings: explanation.keyFindings,
-                  }
-                : null
-            }
-            onNavigateToDashboard={onNavigateToDashboard}
-            onSwitchToScanner={() => setActiveTab('scanner')}
-          />
-        ) : (
-          /* Tab 1: Lab Report Upload and Translation */
-          <>
-            {/* Hero Banner Card */}
-            <div className="bg-gradient-to-br from-slate-900 via-slate-800 to-teal-950 rounded-2xl p-6 sm:p-8 text-white shadow-xl border border-slate-700/60 relative overflow-hidden">
-              <div className="absolute -right-12 -top-12 w-48 h-48 bg-teal-500/10 rounded-full blur-3xl pointer-events-none"></div>
-              <div className="relative z-10 space-y-3">
-                <div className="inline-flex items-center gap-2 px-3 py-1 rounded-full bg-teal-500/20 text-teal-300 text-xs font-semibold border border-teal-500/30">
-                  <Sparkles className="w-3.5 h-3.5" />
-                  <span>Patient-Centric Medical AI • Multimodal Vision</span>
+        {/* Tab 1: Scanner View */}
+        {activeTab === 'scanner' ? (
+          <div id="scanner-panel" role="tabpanel" className="space-y-6">
+            {/* Edge PII Scrubbing Active Shield Banner */}
+            <div
+              className={`rounded-2xl p-4 border transition-all ${
+                isHighContrast
+                  ? 'border-white bg-black'
+                  : 'border-teal-200/80 bg-gradient-to-r from-teal-500/5 via-cyan-500/5 to-emerald-500/5'
+              }`}
+            >
+              <div className="flex items-center justify-between flex-wrap gap-2">
+                <div className="flex items-center gap-2.5">
+                  <div className="p-2 rounded-xl bg-teal-600 text-white shadow-xs">
+                    <ShieldCheck className="w-4 h-4" />
+                  </div>
+                  <div>
+                    <h3 className="text-xs sm:text-sm font-bold text-slate-900 dark:text-white flex items-center gap-1.5">
+                      <span>{getTranslation(language, 'piiScrubberActive')}</span>
+                      <span className="text-[10px] font-bold px-2 py-0.5 rounded-full bg-teal-100 text-teal-800 dark:bg-teal-900/50 dark:text-teal-300">
+                        100% Client-Side
+                      </span>
+                    </h3>
+                    <p className="text-[11px] text-slate-500 dark:text-slate-400 mt-0.5">
+                      {getTranslation(language, 'piiCleanDesc')}
+                    </p>
+                  </div>
                 </div>
-                <h1 className="text-2xl sm:text-3xl font-extrabold tracking-tight text-white">
-                  Translate Your Lab Report Into Plain English
-                </h1>
-                <p className="text-slate-300 text-sm sm:text-base leading-relaxed">
-                  Upload a photo of your blood test, metabolic panel, or pathology results. Sentinel Health decodes complicated medical terminology, highlights critical values, and anonymously logs clinical findings to our regional public health surveillance network.
-                </p>
+
+                {piiScrubStats && piiScrubStats.redactedCount > 0 && (
+                  <div className="text-right">
+                    <span className="inline-flex items-center gap-1 text-[11px] font-bold text-emerald-700 dark:text-emerald-400 bg-emerald-50 dark:bg-emerald-950/40 px-2.5 py-1 rounded-lg border border-emerald-200">
+                      <Lock className="w-3 h-3" />
+                      {piiScrubStats.redactedCount} Identifiers Masked
+                    </span>
+                  </div>
+                )}
               </div>
             </div>
 
-            {/* Upload Form Card */}
-            <div className="bg-white rounded-2xl shadow-sm border border-slate-200/80 p-6 sm:p-8">
+            {/* Main Form Card */}
+            <div
+              className={`rounded-3xl border shadow-xl p-6 sm:p-8 space-y-6 ${
+                isHighContrast
+                  ? 'bg-black border-white'
+                  : 'bg-white border-slate-200/80 shadow-slate-200/50'
+              }`}
+            >
+              <div>
+                <h2 className="text-xl sm:text-2xl font-black tracking-tight text-slate-900 dark:text-white">
+                  {getTranslation(language, 'heroTitle')}
+                </h2>
+                <p className="text-xs sm:text-sm text-slate-600 dark:text-slate-400 mt-1 leading-relaxed">
+                  {getTranslation(language, 'heroDesc')}
+                </p>
+              </div>
+
               <form onSubmit={handleTranslate} className="space-y-6">
-                {/* Step 1: Lab Report Capture / Upload */}
-                <div>
-                  <div className="flex items-center justify-between mb-2">
-                    <label className="block text-sm font-bold text-slate-800">
-                      1. Lab Report Image
+                {/* 1. File Upload Section */}
+                <div className="space-y-2">
+                  <div className="flex items-center justify-between">
+                    <label className="text-sm font-bold text-slate-800 dark:text-slate-200">
+                      {getTranslation(language, 'uploadLabel')}
                     </label>
-                    <span className="text-xs text-slate-500">Supports JPG, PNG, WebP or Camera</span>
+                    <span className="text-xs text-slate-500">
+                      {getTranslation(language, 'uploadHint')}
+                    </span>
                   </div>
 
-                  {/* Upload Dropzone or Preview */}
+                  <input
+                    ref={fileInputRef}
+                    type="file"
+                    accept="image/*"
+                    onChange={handleFileChange}
+                    className="hidden"
+                    id="lab-report-upload"
+                  />
+                  <input
+                    ref={cameraInputRef}
+                    type="file"
+                    accept="image/*"
+                    capture="environment"
+                    onChange={handleFileChange}
+                    className="hidden"
+                    id="lab-report-camera"
+                  />
+
                   {!selectedImage ? (
-                    <div className="space-y-4">
-                      <div className="border-2 border-dashed border-slate-300 hover:border-teal-500 transition-colors rounded-2xl p-6 sm:p-8 text-center bg-slate-50/50">
-                        <input
-                          ref={fileInputRef}
-                          type="file"
-                          accept="image/*"
-                          onChange={handleFileChange}
-                          className="hidden"
-                          id="lab-report-upload"
-                        />
-                        <input
-                          ref={cameraInputRef}
-                          type="file"
-                          accept="image/*"
-                          capture="environment"
-                          onChange={handleFileChange}
-                          className="hidden"
-                          id="lab-report-camera"
-                        />
-
-                        <div className="flex flex-col items-center justify-center gap-3">
-                          <div className="w-14 h-14 rounded-full bg-teal-50 flex items-center justify-center text-teal-600 shadow-inner">
-                            <Upload className="w-7 h-7" />
-                          </div>
-                          <div className="space-y-1">
-                            <p className="text-sm font-semibold text-slate-800">
-                              Click to browse or drag & drop your lab sheet
-                            </p>
-                            <p className="text-xs text-slate-500">
-                              Clear photo or scan of your blood test, CBC, lipid or diabetic report
-                            </p>
-                          </div>
-
-                          <div className="flex flex-wrap items-center justify-center gap-3 pt-2">
-                            <label
-                              htmlFor="lab-report-upload"
-                              className="cursor-pointer inline-flex items-center gap-2 px-4 py-2 rounded-xl text-xs font-semibold bg-white text-slate-700 border border-slate-300 hover:bg-slate-100 shadow-sm transition"
-                            >
-                              <Upload className="w-3.5 h-3.5" />
-                              Browse File
-                            </label>
-                            <label
-                              htmlFor="lab-report-camera"
-                              className="cursor-pointer inline-flex items-center gap-2 px-4 py-2 rounded-xl text-xs font-semibold bg-teal-50 text-teal-700 border border-teal-200 hover:bg-teal-100 shadow-sm transition"
-                            >
-                              <Camera className="w-3.5 h-3.5" />
-                              Take Photo
-                            </label>
-                          </div>
+                    <div
+                      onClick={() => fileInputRef.current?.click()}
+                      className="border-2 border-dashed border-slate-300 dark:border-slate-700 hover:border-teal-500 dark:hover:border-teal-400 rounded-2xl p-6 text-center cursor-pointer transition group bg-slate-50/50 dark:bg-slate-900/40"
+                    >
+                      <div className="flex flex-col items-center justify-center space-y-3">
+                        <div className="w-12 h-12 rounded-2xl bg-teal-50 dark:bg-teal-950/50 flex items-center justify-center text-teal-600 group-hover:scale-110 transition transform">
+                          <Upload className="w-6 h-6" />
                         </div>
-                      </div>
-
-                      {/* Sample Lab Reports Quick Picker */}
-                      <div>
-                        <p className="text-xs font-semibold text-slate-600 uppercase tracking-wider mb-2.5">
-                          Or select a realistic sample lab report to test instantly:
-                        </p>
-                        <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
-                          {SAMPLE_LAB_REPORTS.map((sample) => (
-                            <button
-                              key={sample.id}
-                              type="button"
-                              onClick={() => handleSelectSample(sample)}
-                              className="text-left p-3 rounded-xl border border-slate-200 bg-white hover:border-teal-500 hover:bg-teal-50/40 transition group shadow-sm flex items-start gap-3"
-                            >
-                              <div className="w-8 h-8 rounded-lg bg-teal-100/80 text-teal-700 flex items-center justify-center shrink-0 mt-0.5 group-hover:bg-teal-600 group-hover:text-white transition">
-                                <FileCheck2 className="w-4 h-4" />
-                              </div>
-                              <div className="min-w-0">
-                                <p className="text-xs font-bold text-slate-900 group-hover:text-teal-900 truncate">
-                                  {sample.title}
-                                </p>
-                                <p className="text-[11px] text-slate-500 truncate">{sample.subtitle}</p>
-                                <span className="inline-block mt-1 text-[10px] font-semibold text-teal-700 bg-teal-50 px-1.5 py-0.5 rounded">
-                                  PIN {sample.pincode}
-                                </span>
-                              </div>
-                            </button>
-                          ))}
+                        <div>
+                          <p className="text-sm font-bold text-slate-800 dark:text-slate-200">
+                            {getTranslation(language, 'dropText')}
+                          </p>
+                          <p className="text-xs text-slate-500 mt-0.5">
+                            {getTranslation(language, 'dropSubtext')}
+                          </p>
+                        </div>
+                        <div className="flex items-center gap-2 pt-2">
+                          <button
+                            type="button"
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              fileInputRef.current?.click();
+                            }}
+                            className="px-3 py-1.5 rounded-lg text-xs font-semibold bg-white dark:bg-slate-800 text-slate-700 dark:text-slate-200 border border-slate-300 dark:border-slate-700 hover:bg-slate-100 shadow-xs"
+                          >
+                            {getTranslation(language, 'browseFile')}
+                          </button>
+                          <button
+                            type="button"
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              cameraInputRef.current?.click();
+                            }}
+                            className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold bg-teal-600 hover:bg-teal-500 text-white shadow-xs"
+                          >
+                            <Camera className="w-3.5 h-3.5" />
+                            <span>{getTranslation(language, 'takePhoto')}</span>
+                          </button>
                         </div>
                       </div>
                     </div>
                   ) : (
-                    <div className="relative border border-slate-200 rounded-2xl p-4 bg-slate-50/80 flex flex-col sm:flex-row items-center gap-4">
-                      <div className="w-28 h-36 bg-white rounded-xl shadow-sm border border-slate-200 overflow-hidden shrink-0 flex items-center justify-center p-1">
-                        <img
-                          src={selectedImage}
-                          alt="Uploaded lab report"
-                          className="w-full h-full object-contain"
-                        />
-                      </div>
-                      <div className="flex-1 space-y-1 text-center sm:text-left">
-                        <div className="flex items-center gap-2 justify-center sm:justify-start">
-                          <FileCheck2 className="w-4 h-4 text-emerald-600" />
-                          <span className="text-sm font-bold text-slate-900 truncate max-w-[220px]">
-                            {imageFileName || 'Lab Report Document'}
-                          </span>
+                    <div className="relative rounded-2xl border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-900 p-3 flex items-center justify-between gap-4">
+                      <div className="flex items-center gap-3 min-w-0">
+                        <div className="w-12 h-12 rounded-xl bg-white dark:bg-slate-800 border overflow-hidden flex-shrink-0 flex items-center justify-center">
+                          <img
+                            src={selectedImage}
+                            alt="Lab report preview"
+                            className="w-full h-full object-cover"
+                          />
                         </div>
-                        <p className="text-xs text-slate-500">
-                          Image attached and ready for clinical translation and optical parameter extraction.
-                        </p>
-                        {selectedSample && (
-                          <span className="inline-block px-2 py-0.5 rounded text-[11px] font-semibold bg-teal-100 text-teal-800">
-                            Realistic Sample Dataset Selected
-                          </span>
-                        )}
+                        <div className="min-w-0">
+                          <p className="text-xs font-bold text-slate-900 dark:text-white truncate">
+                            {imageFileName || 'Selected Lab Report Image'}
+                          </p>
+                          <p className="text-[11px] text-teal-600 dark:text-teal-400 font-semibold flex items-center gap-1">
+                            <FileCheck2 className="w-3 h-3" />
+                            Ready for translation
+                          </p>
+                        </div>
                       </div>
                       <button
                         type="button"
                         onClick={handleClearImage}
-                        className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold text-rose-600 hover:bg-rose-50 rounded-lg border border-rose-200 transition"
+                        aria-label="Remove uploaded lab report image"
+                        className="p-1.5 rounded-lg text-slate-400 hover:text-rose-500 hover:bg-rose-50 dark:hover:bg-rose-950/40 transition"
                       >
-                        <X className="w-3.5 h-3.5" />
-                        Change Image
+                        <X className="w-4 h-4" />
                       </button>
                     </div>
                   )}
+
+                  {/* Sample Lab Reports Selector */}
+                  <div className="pt-2">
+                    <p className="text-xs font-semibold text-slate-500 mb-2">
+                      {getTranslation(language, 'sampleSelector')}
+                    </p>
+                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                      {SAMPLE_LAB_REPORTS.map((sample) => (
+                        <button
+                          key={sample.id}
+                          type="button"
+                          onClick={() => handleSelectSample(sample)}
+                          className={`text-left p-2.5 rounded-xl border text-xs transition flex items-center justify-between ${
+                            selectedSample === sample.id
+                              ? 'border-teal-500 bg-teal-50/60 dark:bg-teal-950/40 text-teal-900 dark:text-teal-200 font-bold'
+                              : 'border-slate-200 dark:border-slate-800 hover:border-slate-300 dark:hover:border-slate-700 bg-white dark:bg-slate-900'
+                          }`}
+                        >
+                          <div>
+                            <p className="font-bold">{sample.title}</p>
+                            <p className="text-[10px] text-slate-500 dark:text-slate-400">
+                              {sample.subtitle}
+                            </p>
+                          </div>
+                          <span className="text-[10px] px-2 py-0.5 rounded-full bg-slate-100 dark:bg-slate-800 text-slate-600 dark:text-slate-300">
+                            PIN {sample.pincode}
+                          </span>
+                        </button>
+                      ))}
+                    </div>
+                  </div>
                 </div>
 
-                {/* Step 2: 6-digit Pincode Input */}
-                <div>
-                  <div className="flex items-center justify-between mb-2">
-                    <label htmlFor="pincode-input" className="block text-sm font-bold text-slate-800">
-                      2. 6-Digit Postal Pincode
+                {/* 2. Pincode Input */}
+                <div className="space-y-2">
+                  <div className="flex items-center justify-between">
+                    <label
+                      htmlFor="pincode-input"
+                      className="text-sm font-bold text-slate-800 dark:text-slate-200"
+                    >
+                      {getTranslation(language, 'pincodeLabel')}
                     </label>
-                    <span className="text-xs text-slate-500">Required for regional epidemiological mapping</span>
+                    <span className="text-xs text-slate-500">
+                      {getTranslation(language, 'pincodeHint')}
+                    </span>
                   </div>
 
                   <div className="relative">
-                    <div className="absolute inset-y-0 left-0 pl-3.5 flex items-center pointer-events-none text-slate-400">
-                      <MapPin className="w-5 h-5 text-teal-600" />
-                    </div>
+                    <MapPin className="w-5 h-5 absolute left-3.5 top-1/2 -translate-y-1/2 text-slate-400" />
                     <input
                       id="pincode-input"
                       type="text"
                       maxLength={6}
                       value={pincode}
                       onChange={(e) => setPincode(e.target.value.replace(/\D/g, '').slice(0, 6))}
-                      placeholder="e.g. 560001"
-                      className="w-full pl-11 pr-4 py-3 bg-white border border-slate-300 rounded-xl text-base font-bold text-slate-900 tracking-wider focus:outline-none focus:ring-2 focus:ring-teal-500 focus:border-teal-500 shadow-sm"
+                      placeholder={getTranslation(language, 'pincodePlaceholder')}
+                      aria-label="6-Digit Indian Postal Pincode"
+                      className="w-full pl-11 pr-4 py-2.5 rounded-xl border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 text-slate-900 dark:text-white font-mono text-base font-bold focus:ring-2 focus:ring-teal-500 focus:border-teal-500 tracking-wider shadow-xs"
                     />
                   </div>
 
-                  {/* Detected Locality Badge */}
                   {pincodeInfo && (
-                    <div className="mt-2.5 flex items-center gap-2 text-xs font-semibold text-teal-800 bg-teal-50/80 border border-teal-200/80 px-3 py-1.5 rounded-lg">
-                      <span className="h-2 w-2 rounded-full bg-teal-600"></span>
+                    <div className="flex items-center justify-between text-xs text-slate-500 bg-slate-50 dark:bg-slate-900/60 p-2 rounded-xl border border-slate-200/80 dark:border-slate-800">
                       <span>
-                        Detected Locality: {pincodeInfo.city}, {pincodeInfo.state}
+                        {getTranslation(language, 'detectedLocality')}:{' '}
+                        <strong className="text-teal-700 dark:text-teal-400">
+                          {pincodeInfo.city}, {pincodeInfo.state}
+                        </strong>
+                      </span>
+                      <span className="text-[10px] text-slate-400">
+                        Geo: {pincodeInfo.lat.toFixed(2)}, {pincodeInfo.lng.toFixed(2)}
                       </span>
                     </div>
                   )}
 
-                  {/* Quick Pincode presets */}
-                  <div className="mt-2.5 flex flex-wrap gap-1.5">
-                    <span className="text-[11px] text-slate-500 self-center mr-1">Quick Cities:</span>
+                  {/* Quick City Jumps */}
+                  <div className="flex items-center gap-1.5 flex-wrap pt-1">
+                    <span className="text-[11px] text-slate-400">
+                      {getTranslation(language, 'quickCities')}
+                    </span>
                     {[
-                      { code: '560001', label: 'Bangalore' },
-                      { code: '110001', label: 'Delhi' },
-                      { code: '400001', label: 'Mumbai' },
-                      { code: '500001', label: 'Hyderabad' },
-                      { code: '600001', label: 'Chennai' },
-                      { code: '700001', label: 'Kolkata' },
-                    ].map((item) => (
+                      { city: 'Bengaluru', pin: '560001' },
+                      { city: 'Hyderabad', pin: '500001' },
+                      { city: 'Chennai', pin: '600001' },
+                      { city: 'Delhi', pin: '110001' },
+                      { city: 'Mumbai', pin: '400001' },
+                    ].map((c) => (
                       <button
-                        key={item.code}
+                        key={c.pin}
                         type="button"
-                        onClick={() => setPincode(item.code)}
-                        className={`text-[11px] px-2 py-0.5 rounded-md font-medium transition ${
-                          pincode === item.code
-                            ? 'bg-teal-600 text-white font-bold'
-                            : 'bg-slate-100 text-slate-600 hover:bg-slate-200'
+                        onClick={() => setPincode(c.pin)}
+                        className={`text-[11px] px-2 py-0.5 rounded-md border transition ${
+                          pincode === c.pin
+                            ? 'bg-teal-600 text-white border-teal-600 font-bold'
+                            : 'bg-white dark:bg-slate-800 text-slate-600 dark:text-slate-300 border-slate-200 dark:border-slate-700 hover:bg-slate-100'
                         }`}
                       >
-                        {item.code} ({item.label})
+                        {c.city}
                       </button>
                     ))}
                   </div>
                 </div>
 
-                {/* Error Message */}
                 {errorMessage && (
-                  <div className="p-3.5 rounded-xl bg-rose-50 border border-rose-200 text-rose-700 text-xs font-semibold flex items-center gap-2">
-                    <AlertCircle className="w-4 h-4 shrink-0" />
+                  <div
+                    role="alert"
+                    className="p-3.5 rounded-xl bg-rose-50 text-rose-800 border border-rose-200 text-xs flex items-center gap-2"
+                  >
+                    <AlertCircle className="w-4 h-4 text-rose-600 flex-shrink-0" />
                     <span>{errorMessage}</span>
                   </div>
                 )}
 
-                {/* Submit Button */}
-                <div>
-                  <button
-                    type="submit"
-                    disabled={loading || !selectedImage || pincode.length !== 6}
-                    className="w-full py-4 px-6 rounded-xl font-bold text-white text-base bg-gradient-to-r from-teal-600 via-teal-700 to-cyan-700 hover:from-teal-700 hover:to-cyan-800 shadow-lg shadow-teal-700/25 disabled:opacity-50 disabled:cursor-not-allowed transition duration-200 flex items-center justify-center gap-2"
-                  >
-                    {loading ? (
-                      <span>Processing...</span>
-                    ) : (
-                      <>
-                        <Sparkles className="w-5 h-5" />
-                        <span>Translate Report</span>
-                        <ArrowRight className="w-4 h-4 ml-1" />
-                      </>
-                    )}
-                  </button>
-                </div>
+                {/* Submit Action */}
+                <button
+                  type="submit"
+                  disabled={loading || !selectedImage || pincode.length !== 6}
+                  className="w-full py-3.5 px-4 rounded-xl font-bold text-sm bg-gradient-to-r from-teal-600 to-cyan-600 hover:from-teal-500 hover:to-cyan-500 text-white shadow-lg shadow-teal-600/20 disabled:opacity-50 disabled:cursor-not-allowed transition duration-150 flex items-center justify-center gap-2 focus:ring-4 focus:ring-teal-500/30"
+                >
+                  {loading ? (
+                    <>
+                      <RefreshCw className="w-4 h-4 animate-spin" />
+                      <span>{getTranslation(language, 'processingButton')}</span>
+                    </>
+                  ) : (
+                    <>
+                      <Sparkles className="w-4 h-4" />
+                      <span>
+                        {getTranslation(language, 'translateButton')} (
+                        {SUPPORTED_LANGUAGES.find((l) => l.code === language)?.nativeName})
+                      </span>
+                    </>
+                  )}
+                </button>
               </form>
+            </div>
 
-              {/* Professional Loading State Spinner */}
-              {loading && (
-                <div className="mt-8 pt-8 border-t border-slate-200">
-                  <div className="flex flex-col items-center justify-center text-center space-y-4">
-                    {/* Radar Medical Scanner Animation */}
-                    <div className="relative w-20 h-20 flex items-center justify-center">
-                      <div className="absolute inset-0 rounded-full border-4 border-teal-200 animate-ping opacity-30"></div>
-                      <div className="absolute inset-2 rounded-full border-4 border-t-teal-600 border-r-transparent border-b-cyan-500 border-l-transparent animate-spin"></div>
-                      <div className="w-10 h-10 rounded-full bg-teal-50 flex items-center justify-center text-teal-600 shadow-inner">
-                        <HeartPulse className="w-5 h-5 animate-pulse text-teal-600" />
-                      </div>
+            {/* Loading Indicator */}
+            {loading && (
+              <div
+                role="status"
+                aria-live="polite"
+                className="rounded-3xl border border-teal-200 bg-white dark:bg-slate-900 p-8 text-center space-y-4 shadow-xl"
+              >
+                <div className="relative w-16 h-16 mx-auto">
+                  <div className="absolute inset-0 rounded-full border-4 border-teal-200 dark:border-teal-900 animate-ping opacity-30"></div>
+                  <div className="relative w-16 h-16 rounded-full border-4 border-teal-600 border-t-transparent animate-spin flex items-center justify-center">
+                    <HeartPulse className="w-6 h-6 text-teal-600" />
+                  </div>
+                </div>
+                <div className="space-y-1">
+                  <h3 className="text-base font-bold text-slate-900 dark:text-white">
+                    {loadingStage === 1 && 'Decoding medical report terminology...'}
+                    {loadingStage === 2 && 'Scrubbing personal identifiers (Edge PII)...'}
+                    {loadingStage === 3 && `Translating into ${language.toUpperCase()}...`}
+                    {loadingStage === 4 && 'Syncing epidemiological surveillance signals...'}
+                  </h3>
+                  <p className="text-xs text-slate-500">
+                    Applying multimodal intelligence with Gemini 3.8 Flash
+                  </p>
+                </div>
+              </div>
+            )}
+
+            {/* Translation Output Results */}
+            {explanation && (
+              <div
+                ref={resultsRef}
+                tabIndex={-1}
+                aria-label="Medical Lab Report Translation Results"
+                className="rounded-3xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 shadow-xl overflow-hidden space-y-6 p-6 sm:p-8"
+              >
+                {/* Header Banner */}
+                <div className="flex items-start justify-between flex-wrap gap-4 border-b border-slate-200/80 dark:border-slate-800 pb-5">
+                  <div className="space-y-1">
+                    <div className="flex items-center gap-2">
+                      <span className="p-1 rounded-md bg-teal-500/10 text-teal-600">
+                        <CheckCircle2 className="w-4 h-4" />
+                      </span>
+                      <span className="text-xs font-bold text-teal-700 dark:text-teal-400 uppercase tracking-wider">
+                        {getTranslation(language, 'educationalDisclaimerTag')}
+                      </span>
                     </div>
+                    <h3 className="text-xl sm:text-2xl font-black text-slate-900 dark:text-white">
+                      {explanation.title}
+                    </h3>
+                  </div>
 
-                    <div className="space-y-1">
-                      <h3 className="text-base font-bold text-slate-900">
-                        Sentinel Medical AI Translating Report...
-                      </h3>
-                      <p className="text-xs text-slate-500">
-                        Evaluating clinical metrics, translating terminology, and syncing surveillance database.
+                  <div className="flex items-center gap-2">
+                    {getSeverityBadge(explanation.severity)}
+                    <button
+                      type="button"
+                      onClick={handleSpeakSummary}
+                      aria-label={
+                        isPlayingAudio
+                          ? getTranslation(language, 'stopListening')
+                          : getTranslation(language, 'listenSummary')
+                      }
+                      className={`p-2 rounded-xl text-xs font-bold flex items-center gap-1.5 transition ${
+                        isPlayingAudio
+                          ? 'bg-rose-600 text-white'
+                          : 'bg-slate-100 dark:bg-slate-800 hover:bg-slate-200 dark:hover:bg-slate-700 text-slate-700 dark:text-slate-200'
+                      }`}
+                    >
+                      {isPlayingAudio ? (
+                        <>
+                          <VolumeX className="w-4 h-4 animate-pulse" />
+                          <span className="hidden sm:inline">
+                            {getTranslation(language, 'stopListening')}
+                          </span>
+                        </>
+                      ) : (
+                        <>
+                          <Volume2 className="w-4 h-4" />
+                          <span className="hidden sm:inline">
+                            {getTranslation(language, 'listenSummary')}
+                          </span>
+                        </>
+                      )}
+                    </button>
+                  </div>
+                </div>
+
+                {/* Overall Summary Card */}
+                <div className="rounded-2xl bg-teal-50/70 dark:bg-teal-950/30 border border-teal-200 dark:border-teal-800/60 p-4 sm:p-5">
+                  <p className="text-sm text-slate-800 dark:text-slate-200 leading-relaxed font-medium">
+                    {explanation.summary}
+                  </p>
+                </div>
+
+                {/* Extracted Surveillance Tag Card */}
+                <div className="rounded-2xl bg-slate-50 dark:bg-slate-800/50 border border-slate-200 dark:border-slate-700 p-4 flex items-center justify-between flex-wrap gap-3">
+                  <div className="flex items-center gap-3">
+                    <div className="p-2.5 rounded-xl bg-slate-900 text-teal-400">
+                      <HeartPulse className="w-5 h-5" />
+                    </div>
+                    <div>
+                      <p className="text-[11px] font-bold text-slate-500 uppercase tracking-wider">
+                        Extracted Surveillance Signal
+                      </p>
+                      <p className="text-sm font-black text-slate-900 dark:text-white">
+                        {explanation.symptom}
                       </p>
                     </div>
+                  </div>
 
-                    {/* Stepper Progress Bar */}
-                    <div className="w-full max-w-md bg-slate-100 rounded-full h-2 overflow-hidden">
-                      <div
-                        className="h-full bg-gradient-to-r from-teal-500 to-cyan-500 transition-all duration-500 rounded-full"
-                        style={{ width: `${(loadingStage / 4) * 100}%` }}
-                      ></div>
-                    </div>
+                  <button
+                    type="button"
+                    onClick={() => onNavigateToDashboard(pincode)}
+                    className="inline-flex items-center gap-1.5 px-3.5 py-1.5 rounded-xl text-xs font-bold bg-slate-900 text-teal-400 hover:bg-slate-800 transition shadow-xs"
+                  >
+                    <span>{getTranslation(language, 'viewOnMap')}</span>
+                    <ArrowRight className="w-3.5 h-3.5" />
+                  </button>
+                </div>
 
-                    {/* Step checklist */}
-                    <div className="w-full max-w-sm text-left space-y-2 pt-2">
-                      {[
-                        { step: 1, text: 'Scanning lab imagery & layout structure...' },
-                        { step: 2, text: 'Extracting biomarkers & normal reference ranges...' },
-                        { step: 3, text: 'Generating patient-friendly clinical translation...' },
-                        { step: 4, text: 'Persisting anonymized symptom & PIN to Firestore...' },
-                      ].map((s) => (
-                        <div key={s.step} className="flex items-center gap-2 text-xs">
-                          {loadingStage > s.step ? (
-                            <CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0" />
-                          ) : loadingStage === s.step ? (
-                            <div className="w-4 h-4 rounded-full border-2 border-teal-600 border-t-transparent animate-spin shrink-0"></div>
-                          ) : (
-                            <div className="w-4 h-4 rounded-full border border-slate-300 shrink-0"></div>
-                          )}
-                          <span
-                            className={
-                              loadingStage === s.step
-                                ? 'font-bold text-teal-800'
-                                : loadingStage > s.step
-                                ? 'text-slate-600'
-                                : 'text-slate-400'
-                            }
-                          >
-                            {s.text}
-                          </span>
+                {/* Key Findings Table */}
+                {explanation.keyFindings && explanation.keyFindings.length > 0 && (
+                  <div className="space-y-3">
+                    <h4 className="text-sm font-extrabold text-slate-900 dark:text-white uppercase tracking-wider">
+                      {getTranslation(language, 'keyFindingsLabel')}
+                    </h4>
+                    <div className="border border-slate-200 dark:border-slate-800 rounded-2xl overflow-hidden divide-y divide-slate-100 dark:divide-slate-800">
+                      {explanation.keyFindings.map((finding, idx) => (
+                        <div
+                          key={idx}
+                          className="p-3.5 sm:p-4 bg-white dark:bg-slate-900/60 flex flex-col sm:flex-row sm:items-center justify-between gap-2"
+                        >
+                          <div className="space-y-1">
+                            <div className="flex items-center gap-2">
+                              <span className="font-bold text-xs sm:text-sm text-slate-900 dark:text-white">
+                                {finding.parameter}
+                              </span>
+                              {getStatusChip(finding.status)}
+                            </div>
+                            <p className="text-xs text-slate-600 dark:text-slate-400">
+                              {finding.interpretation}
+                            </p>
+                          </div>
+                          <div className="text-left sm:text-right flex-shrink-0">
+                            <p className="text-sm font-mono font-black text-slate-900 dark:text-white">
+                              {finding.value}
+                            </p>
+                            <p className="text-[11px] text-slate-400">
+                              Ref: {finding.referenceRange}
+                            </p>
+                          </div>
                         </div>
                       ))}
                     </div>
                   </div>
-                </div>
-              )}
-            </div>
+                )}
 
-            {/* Results Card Area */}
-            {explanation && (
-              <div ref={resultsRef} className="space-y-6">
-                {/* Header & Badges */}
-                <div className="bg-white rounded-2xl shadow-sm border border-slate-200/80 p-6 sm:p-8 space-y-6">
-                  <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 pb-4 border-b border-slate-100">
-                    <div>
-                      <div className="flex items-center gap-2 mb-1">
-                        <span className="px-2.5 py-0.5 rounded-full text-xs font-semibold bg-teal-100 text-teal-800">
-                          {explanation.category}
-                        </span>
-                        {getSeverityBadge(explanation.severity)}
-                      </div>
-                      <h2 className="text-xl sm:text-2xl font-extrabold text-slate-900">
-                        {explanation.title}
-                      </h2>
-                    </div>
-
-                    <div className="flex items-center gap-2">
-                      {/* Discuss in Chat Button */}
-                      <button
-                        type="button"
-                        onClick={() => setActiveTab('chat')}
-                        className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-xl text-xs font-bold bg-teal-600 hover:bg-teal-700 text-white transition shadow-sm"
-                        title="Discuss these results with AI Assistant"
-                      >
-                        <MessageSquare className="w-4 h-4" />
-                        <span>Chat About Results</span>
-                      </button>
-
-                      {/* Read Aloud Audio Button */}
-                      <button
-                        type="button"
-                        onClick={handleSpeakSummary}
-                        className="inline-flex items-center gap-2 px-3 py-2 rounded-xl text-xs font-bold bg-slate-100 hover:bg-slate-200 text-slate-700 transition"
-                        title="Listen to report summary audio"
-                      >
-                        {isPlayingAudio ? (
-                          <>
-                            <VolumeX className="w-4 h-4 text-rose-600" />
-                            <span>Stop</span>
-                          </>
-                        ) : (
-                          <>
-                            <Volume2 className="w-4 h-4 text-teal-600" />
-                            <span>Listen</span>
-                          </>
-                        )}
-                      </button>
-                    </div>
-                  </div>
-
-                  {/* Firestore Surveillance Persistence Notice Banner */}
-                  <div className="p-4 rounded-xl bg-teal-50 border border-teal-200 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
-                    <div className="flex items-start gap-3">
-                      <ShieldCheck className="w-5 h-5 text-teal-700 shrink-0 mt-0.5" />
-                      <div>
-                        <p className="text-xs font-bold text-teal-900">
-                          Logged to Public Health Surveillance (Firestore)
-                        </p>
-                        <p className="text-xs text-teal-700">
-                          Extracted symptom: <span className="font-extrabold">"{explanation.symptom}"</span> under PIN <span className="font-bold">{pincode}</span> ({pincodeInfo?.city}).
-                        </p>
-                      </div>
-                    </div>
-                    <button
-                      onClick={() => onNavigateToDashboard(pincode)}
-                      className="shrink-0 inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-bold bg-slate-900 text-teal-400 hover:bg-slate-800 transition"
-                    >
-                      <span>View on Admin Map</span>
-                      <ChevronRight className="w-3.5 h-3.5" />
-                    </button>
-                  </div>
-
-                  {/* Plain English Summary */}
+                {/* What it means */}
+                {explanation.whatItMeans && (
                   <div className="space-y-2">
-                    <h3 className="text-sm font-bold text-slate-900 flex items-center gap-2">
-                      <Stethoscope className="w-4 h-4 text-teal-600" />
-                      <span>Clinical Summary in Plain Words</span>
-                    </h3>
-                    <p className="text-sm text-slate-700 leading-relaxed bg-slate-50 p-4 rounded-xl border border-slate-200/60">
-                      {explanation.summary}
-                    </p>
-                  </div>
-
-                  {/* Biomarkers / Key Findings Table */}
-                  {explanation.keyFindings && explanation.keyFindings.length > 0 && (
-                    <div className="space-y-3">
-                      <h3 className="text-sm font-bold text-slate-900">
-                        Specific Test Values & Findings
-                      </h3>
-                      <div className="overflow-x-auto rounded-xl border border-slate-200">
-                        <table className="w-full text-left text-xs">
-                          <thead className="bg-slate-100 text-slate-700 font-bold border-b border-slate-200">
-                            <tr>
-                              <th className="py-2.5 px-3">Test Parameter</th>
-                              <th className="py-2.5 px-3">Your Result</th>
-                              <th className="py-2.5 px-3">Reference Range</th>
-                              <th className="py-2.5 px-3">Status</th>
-                              <th className="py-2.5 px-3">What This Means</th>
-                            </tr>
-                          </thead>
-                          <tbody className="divide-y divide-slate-100 bg-white">
-                            {explanation.keyFindings.map((finding, idx) => (
-                              <tr key={idx} className="hover:bg-slate-50/70 transition">
-                                <td className="py-2.5 px-3 font-semibold text-slate-900">
-                                  {finding.parameter}
-                                </td>
-                                <td className="py-2.5 px-3 font-extrabold text-slate-900">
-                                  {finding.value}
-                                </td>
-                                <td className="py-2.5 px-3 text-slate-500">
-                                  {finding.referenceRange}
-                                </td>
-                                <td className="py-2.5 px-3">
-                                  {getStatusChip(finding.status)}
-                                </td>
-                                <td className="py-2.5 px-3 text-slate-600 text-[11px]">
-                                  {finding.interpretation}
-                                </td>
-                              </tr>
-                            ))}
-                          </tbody>
-                        </table>
-                      </div>
-                    </div>
-                  )}
-
-                  {/* What It Means For Your Body */}
-                  <div className="space-y-2">
-                    <h3 className="text-sm font-bold text-slate-900">
-                      What This Means For Your Body
-                    </h3>
-                    <p className="text-sm text-slate-600 leading-relaxed">
+                    <h4 className="text-sm font-bold text-slate-900 dark:text-white">
+                      {getTranslation(language, 'whatItMeans')}
+                    </h4>
+                    <p className="text-xs sm:text-sm text-slate-700 dark:text-slate-300 leading-relaxed">
                       {explanation.whatItMeans}
                     </p>
                   </div>
+                )}
 
-                  {/* Questions for Doctor */}
-                  {explanation.questionsForDoctor && explanation.questionsForDoctor.length > 0 && (
-                    <div className="space-y-2.5 bg-blue-50/60 border border-blue-200/80 p-4 rounded-xl">
-                      <h3 className="text-xs font-bold text-blue-900 uppercase tracking-wider flex items-center gap-1.5">
-                        <HelpCircle className="w-3.5 h-3.5 text-blue-600" />
-                        <span>Questions to ask your doctor at your next visit:</span>
-                      </h3>
-                      <ul className="space-y-2">
-                        {explanation.questionsForDoctor.map((q, idx) => (
-                          <li key={idx} className="text-xs text-blue-950 flex items-start gap-2">
-                            <span className="w-4 h-4 rounded-full bg-blue-200 text-blue-900 font-bold flex items-center justify-center text-[10px] shrink-0 mt-0.5">
-                              {idx + 1}
-                            </span>
-                            <span>{q}</span>
-                          </li>
-                        ))}
-                      </ul>
-                    </div>
-                  )}
-
-                  {/* Lifestyle Guidance */}
-                  {explanation.lifestyleGuidance && explanation.lifestyleGuidance.length > 0 && (
-                    <div className="space-y-2">
-                      <h3 className="text-xs font-bold text-slate-700 uppercase tracking-wider">
-                        Practical Lifestyle & Follow-up Tips:
-                      </h3>
-                      <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
-                        {explanation.lifestyleGuidance.map((tip, idx) => (
-                          <div
-                            key={idx}
-                            className="p-3 rounded-lg bg-slate-50 border border-slate-200 text-xs text-slate-700 flex items-start gap-2"
-                          >
-                            <CheckCircle2 className="w-4 h-4 text-teal-600 shrink-0 mt-0.5" />
-                            <span>{tip}</span>
-                          </div>
-                        ))}
-                      </div>
-                    </div>
-                  )}
-
-                  {/* Medical Disclaimer */}
-                  <div className="p-3.5 rounded-xl bg-amber-50/80 border border-amber-200 text-amber-900 text-xs space-y-1">
-                    <p className="font-bold">Medical Disclaimer:</p>
-                    <p className="text-[11px] leading-relaxed text-amber-800">
-                      {explanation.disclaimer ||
-                        'Sentinel Health is an educational lab report translation tool powered by Google Gemini AI. It does not provide medical diagnosis, treatment plans, or prescription recommendations. Always discuss laboratory test results with a qualified healthcare provider.'}
-                    </p>
+                {/* Questions for Doctor */}
+                {explanation.questionsForDoctor && explanation.questionsForDoctor.length > 0 && (
+                  <div className="space-y-2">
+                    <h4 className="text-sm font-bold text-slate-900 dark:text-white">
+                      {getTranslation(language, 'questionsForDoctor')}
+                    </h4>
+                    <ul className="space-y-1.5 list-disc list-inside text-xs sm:text-sm text-slate-700 dark:text-slate-300">
+                      {explanation.questionsForDoctor.map((q, i) => (
+                        <li key={i}>{q}</li>
+                      ))}
+                    </ul>
                   </div>
+                )}
 
-                  {/* Actions Footer */}
-                  <div className="flex flex-wrap items-center justify-between gap-3 pt-4 border-t border-slate-100">
-                    <div className="flex items-center gap-2">
-                      <button
-                        type="button"
-                        onClick={() => {
-                          handleClearImage();
-                          setExplanation(null);
-                        }}
-                        className="inline-flex items-center gap-1.5 px-4 py-2 rounded-xl text-xs font-semibold bg-slate-100 hover:bg-slate-200 text-slate-700 transition"
-                      >
-                        <RefreshCw className="w-3.5 h-3.5" />
-                        Translate Another Report
-                      </button>
-
-                      <button
-                        type="button"
-                        onClick={() => setActiveTab('chat')}
-                        className="inline-flex items-center gap-1.5 px-4 py-2 rounded-xl text-xs font-bold bg-teal-50 text-teal-700 border border-teal-200 hover:bg-teal-100 transition"
-                      >
-                        <MessageSquare className="w-3.5 h-3.5" />
-                        Chat About Symptoms
-                      </button>
-                    </div>
-
-                    <button
-                      type="button"
-                      onClick={() => onNavigateToDashboard(pincode)}
-                      className="inline-flex items-center gap-2 px-5 py-2.5 rounded-xl text-xs font-bold bg-slate-900 text-teal-400 hover:bg-slate-800 transition shadow-md"
-                    >
-                      <span>Explore Admin Heatmap Dashboard</span>
-                      <ArrowRight className="w-3.5 h-3.5" />
-                    </button>
+                {/* Lifestyle Guidance */}
+                {explanation.lifestyleGuidance && explanation.lifestyleGuidance.length > 0 && (
+                  <div className="space-y-2">
+                    <h4 className="text-sm font-bold text-slate-900 dark:text-white">
+                      {getTranslation(language, 'lifestyleGuidance')}
+                    </h4>
+                    <ul className="space-y-1.5 list-disc list-inside text-xs sm:text-sm text-slate-700 dark:text-slate-300">
+                      {explanation.lifestyleGuidance.map((tip, i) => (
+                        <li key={i}>{tip}</li>
+                      ))}
+                    </ul>
                   </div>
+                )}
+
+                {/* Medical Disclaimer */}
+                <div className="pt-3 border-t border-slate-200 dark:border-slate-800 text-[11px] text-slate-400">
+                  {explanation.disclaimer || getTranslation(language, 'medicalDisclaimer')}
                 </div>
               </div>
             )}
-          </>
+          </div>
+        ) : (
+          /* Tab 2: Symptom Health Chat */
+          <div id="chat-panel" role="tabpanel">
+            <SymptomChat
+              pincode={pincode}
+              targetLanguage={language}
+              reportContext={
+                explanation
+                  ? {
+                      title: explanation.title,
+                      summary: explanation.summary,
+                      symptom: explanation.symptom,
+                      keyFindings: explanation.keyFindings,
+                    }
+                  : null
+              }
+              onNavigateToDashboard={onNavigateToDashboard}
+              onSwitchToScanner={() => setActiveTab('scanner')}
+            />
+          </div>
         )}
       </div>
     </div>

@@ -1,12 +1,93 @@
-import express, { Request, Response } from 'express';
+import express, { Request, Response, NextFunction } from 'express';
 import { GoogleGenAI } from '@google/genai';
 import firebaseConfig from '../firebase-applet-config.json';
 import { getPincodeLocation, SEED_SURVEILLANCE_REPORTS } from '../src/lib/pincodeData';
 
 export const apiApp = express();
-apiApp.use(express.json({ limit: '20mb' }));
+apiApp.use(express.json({ limit: '15mb' }));
 
-// Shared Gemini client utility on the server per system guidelines
+// -------------------------------------------------------------
+// 1. Enterprise-Grade Security: Rate Limiting & Input Validation
+// -------------------------------------------------------------
+
+interface RateLimitBucket {
+  tokens: number;
+  lastRefill: number;
+}
+
+const rateLimitStore = new Map<string, RateLimitBucket>();
+
+/**
+ * Lightweight sliding token-bucket rate limiter middleware
+ */
+function createRateLimiter(maxTokens: number, refillIntervalMs: number) {
+  return (req: Request, res: Response, next: NextFunction): void => {
+    const rawIp =
+      (req.headers['x-forwarded-for'] as string) ||
+      req.socket.remoteAddress ||
+      'anonymous';
+    const clientIp = rawIp.split(',')[0].trim();
+    const now = Date.now();
+
+    let bucket = rateLimitStore.get(clientIp);
+    if (!bucket) {
+      bucket = { tokens: maxTokens, lastRefill: now };
+      rateLimitStore.set(clientIp, bucket);
+    } else {
+      const elapsed = now - bucket.lastRefill;
+      const tokensToAdd = Math.floor(elapsed / refillIntervalMs) * maxTokens;
+      if (tokensToAdd > 0) {
+        bucket.tokens = Math.min(maxTokens, bucket.tokens + tokensToAdd);
+        bucket.lastRefill = now;
+      }
+    }
+
+    if (bucket.tokens <= 0) {
+      const retryAfter = Math.ceil(refillIntervalMs / 1000);
+      res.setHeader('Retry-After', retryAfter.toString());
+      res.setHeader('X-RateLimit-Limit', maxTokens.toString());
+      res.setHeader('X-RateLimit-Remaining', '0');
+      res.status(429).json({
+        error: 'Too Many Requests: Rate limit exceeded.',
+        message: 'Sentinel Health rate-limiting triggered to protect model quotas and backend stability.',
+        retryAfterSeconds: retryAfter,
+      });
+      return;
+    }
+
+    bucket.tokens -= 1;
+    res.setHeader('X-RateLimit-Limit', maxTokens.toString());
+    res.setHeader('X-RateLimit-Remaining', bucket.tokens.toString());
+    next();
+  };
+}
+
+// Rate limiters for different tiers of endpoints
+const reportRateLimiter = createRateLimiter(25, 60000); // 25 calls / minute
+const chatRateLimiter = createRateLimiter(40, 60000);   // 40 calls / minute
+const signalsRateLimiter = createRateLimiter(120, 60000); // 120 calls / minute
+
+// -------------------------------------------------------------
+// 2. High-Speed In-Memory Cache for Surveillance / Signals API
+// -------------------------------------------------------------
+
+interface SignalsCache {
+  data: any[];
+  timestamp: number;
+  etag: string;
+}
+
+let surveillanceCache: SignalsCache | null = null;
+const CACHE_TTL_MS = 25000; // 25 seconds TTL
+
+export function invalidateSignalsCache(): void {
+  surveillanceCache = null;
+}
+
+// -------------------------------------------------------------
+// 3. Shared Gemini Client
+// -------------------------------------------------------------
+
 function getGeminiClient(): GoogleGenAI | null {
   const apiKey = process.env.GEMINI_API_KEY;
   if (!apiKey) {
@@ -62,6 +143,7 @@ async function saveToFirestoreRest(record: {
 
     if (res.ok) {
       const data = await res.json();
+      invalidateSignalsCache();
       const docName = data.name || '';
       return docName.split('/').pop() || null;
     } else {
@@ -75,57 +157,80 @@ async function saveToFirestoreRest(record: {
   }
 }
 
-/**
- * Endpoint to analyze lab report image using Gemini API,
- * generate patient-friendly explanation, and save symptom & pincode to Firestore.
- */
-apiApp.post('/api/analyze-report', async (req: Request, res: Response): Promise<void> => {
-  try {
-    const { image, mimeType = 'image/jpeg', pincode } = req.body;
+// -------------------------------------------------------------
+// 4. Report Analysis Endpoint (with i18n & Edge-scrubbed ingestion)
+// -------------------------------------------------------------
 
-    if (!image) {
-      res.status(400).json({ error: 'Lab report image is required.' });
-      return;
-    }
+apiApp.post(
+  '/api/analyze-report',
+  reportRateLimiter,
+  async (req: Request, res: Response): Promise<void> => {
+    try {
+      const { image, mimeType = 'image/jpeg', pincode, targetLanguage = 'en' } = req.body;
 
-    const cleanPincode = (pincode || '').replace(/\D/g, '').slice(0, 6);
-    if (cleanPincode.length !== 6) {
-      res.status(400).json({ error: 'A valid 6-digit postal code (pincode) is required.' });
-      return;
-    }
+      // Strict validation
+      if (!image || typeof image !== 'string') {
+        res.status(400).json({ error: 'Valid lab report image payload is required.' });
+        return;
+      }
 
-    const location = getPincodeLocation(cleanPincode);
+      if (image.length > 20 * 1024 * 1024) {
+        res.status(413).json({ error: 'Payload exceeds maximum allowed size (15MB).' });
+        return;
+      }
 
-    // Extract base64 payload from data URL if needed
-    let base64Data = image;
-    let resolvedMimeType = mimeType;
-    if (image.startsWith('data:')) {
-      const match = image.match(/^data:([^;]+);base64,(.+)$/);
-      if (match) {
-        resolvedMimeType = match[1];
-        base64Data = match[2];
-      } else {
-        // SVG or plain data
-        const plainMatch = image.match(/^data:([^,]+),(.*)$/);
-        if (plainMatch) {
-          resolvedMimeType = plainMatch[1].split(';')[0];
-          base64Data = Buffer.from(decodeURIComponent(plainMatch[2])).toString('base64');
+      const cleanPincode = (pincode || '').replace(/\D/g, '').slice(0, 6);
+      if (!/^[1-9][0-9]{5}$/.test(cleanPincode)) {
+        res.status(400).json({
+          error: 'A valid 6-digit Indian postal code (pincode starting with 1-9) is required.',
+        });
+        return;
+      }
+
+      const validLanguages = ['en', 'te', 'hi', 'ta'];
+      const lang = validLanguages.includes(targetLanguage) ? targetLanguage : 'en';
+
+      const location = getPincodeLocation(cleanPincode);
+
+      // Extract base64 payload from data URL
+      let base64Data = image;
+      let resolvedMimeType = mimeType;
+      if (image.startsWith('data:')) {
+        const match = image.match(/^data:([^;]+);base64,(.+)$/);
+        if (match) {
+          resolvedMimeType = match[1];
+          base64Data = match[2];
+        } else {
+          const plainMatch = image.match(/^data:([^,]+),(.*)$/);
+          if (plainMatch) {
+            resolvedMimeType = plainMatch[1].split(';')[0];
+            base64Data = Buffer.from(decodeURIComponent(plainMatch[2])).toString('base64');
+          }
         }
       }
-    }
 
-    const ai = getGeminiClient();
-    let analysisResult: any = null;
+      const ai = getGeminiClient();
+      let analysisResult: any = null;
 
-    if (ai) {
-      try {
-        const prompt = `You are Sentinel Health, an expert pathologist and empathetic clinical health educator.
-Analyze this medical lab test report image thoroughly.
+      const languageInstructions: Record<string, string> = {
+        en: 'Explain all findings, summary, interpretation, questions, and guidance in clear, comforting plain English.',
+        te: 'Explain the summary, whatItMeans, questionsForDoctor, lifestyleGuidance, and parameter interpretations in fluent, natural Telugu script (తెలుగు), while keeping parameter names in English.',
+        hi: 'Explain the summary, whatItMeans, questionsForDoctor, lifestyleGuidance, and parameter interpretations in natural, comforting Hindi Devanagari script (हिन्दी), while keeping parameter names in English.',
+        ta: 'Explain the summary, whatItMeans, questionsForDoctor, lifestyleGuidance, and parameter interpretations in clear, accessible Tamil script (தமிழ்), while keeping parameter names in English.',
+      };
 
-Provide your output strictly in valid JSON matching this structure:
+      if (ai) {
+        try {
+          const prompt = `You are Sentinel Health, an expert pathologist and empathetic clinical health educator.
+Analyze this medical lab test report image thoroughly. Notice that personal identifiers (PII) may have been redacted on the client side for patient privacy.
+
+LANGUAGE REQUIREMENT:
+${languageInstructions[lang] || languageInstructions.en}
+
+Provide your output strictly in valid JSON matching this schema:
 {
-  "title": "Clear diagnostic panel title (e.g. Glycemic Evaluation & Diabetic Risk Panel)",
-  "summary": "2-3 conversational, reassuring sentences explaining the overall picture in plain English without medical jargon.",
+  "title": "Clear diagnostic panel title",
+  "summary": "2-3 conversational, reassuring sentences explaining the overall picture without medical jargon.",
   "symptom": "Short extracted clinical finding or symptom keyword (max 8 words, e.g. 'Hyperglycemia / Elevated Glucose' or 'Leukocytosis / Bacterial Infection' or 'Hypercholesterolemia' or 'Normal Biomarkers')",
   "category": "Metabolic" | "Hematology" | "Cardiovascular" | "Hepatic" | "Renal" | "Endocrine" | "Immunology" | "General Health",
   "severity": "low" | "moderate" | "high" | "critical",
@@ -139,9 +244,9 @@ Provide your output strictly in valid JSON matching this structure:
       "interpretation": "1 simple sentence explaining what this specific number indicates."
     }
   ],
-  "whatItMeans": "A friendly paragraph translating what these results mean for the patient's body, energy, and day-to-day health.",
+  "whatItMeans": "A friendly paragraph translating what these results mean for the patient's body and day-to-day health.",
   "questionsForDoctor": [
-    "3 to 4 specific, actionable questions the patient should ask their primary care doctor during their consultation."
+    "3 to 4 specific, actionable questions the patient should ask their primary care doctor."
   ],
   "lifestyleGuidance": [
     "3 to 4 practical, non-prescriptive daily habits, dietary tips, or lifestyle follow-ups."
@@ -149,87 +254,87 @@ Provide your output strictly in valid JSON matching this structure:
   "disclaimer": "This analysis is an AI-generated educational summary designed to help you prepare for a conversation with your healthcare provider. It is not an official medical diagnosis or prescription."
 }`;
 
-        const response = await ai.models.generateContent({
-          model: 'gemini-3.8-flash',
-          contents: [
-            {
-              inlineData: {
-                mimeType: resolvedMimeType.includes('svg') ? 'image/png' : resolvedMimeType,
-                data: base64Data,
+          const response = await ai.models.generateContent({
+            model: 'gemini-3.8-flash',
+            contents: [
+              {
+                inlineData: {
+                  mimeType: resolvedMimeType.includes('svg') ? 'image/png' : resolvedMimeType,
+                  data: base64Data,
+                },
               },
+              { text: prompt },
+            ],
+            config: {
+              responseMimeType: 'application/json',
             },
-            { text: prompt },
-          ],
-          config: {
-            responseMimeType: 'application/json',
-          },
-        });
+          });
 
-        const rawText = response.text || '';
-        try {
-          analysisResult = JSON.parse(rawText.trim());
-        } catch {
-          // Attempt markdown fence extraction
-          const cleaned = rawText.replace(/```json/g, '').replace(/```/g, '').trim();
-          analysisResult = JSON.parse(cleaned);
+          const rawText = response.text || '';
+          try {
+            analysisResult = JSON.parse(rawText.trim());
+          } catch {
+            const cleaned = rawText.replace(/```json/g, '').replace(/```/g, '').trim();
+            analysisResult = JSON.parse(cleaned);
+          }
+        } catch (geminiErr) {
+          console.warn('Gemini vision model fallback triggered:', geminiErr);
         }
-      } catch (geminiErr) {
-        console.warn('Gemini vision model fallback triggered:', geminiErr);
       }
+
+      // Heuristic clinical fallback if Gemini key is missing or prompt failed
+      if (!analysisResult) {
+        analysisResult = generateFallbackMedicalAnalysis(base64Data, cleanPincode, lang);
+      }
+
+      const extractedSymptom = analysisResult.symptom || 'General Biomarker Elevation';
+      const extractedSeverity = analysisResult.severity || 'moderate';
+      const extractedCategory = analysisResult.category || 'General Health';
+      const confidenceScore = analysisResult.confidenceScore || 0.94;
+      const createdAt = new Date().toISOString();
+
+      const firestoreRecord = {
+        pincode: cleanPincode,
+        symptom: extractedSymptom,
+        category: extractedCategory,
+        severity: extractedSeverity,
+        lat: location.lat,
+        lng: location.lng,
+        regionName: `${location.city}, ${location.state}`,
+        confidenceScore,
+        createdAt,
+      };
+
+      const docId = await saveToFirestoreRest(firestoreRecord);
+
+      res.json({
+        success: true,
+        docId,
+        explanation: analysisResult,
+        language: lang,
+        surveillanceRecord: {
+          id: docId || `loc-${Date.now()}`,
+          ...firestoreRecord,
+        },
+      });
+    } catch (error: any) {
+      console.error('API Error in /api/analyze-report:', error);
+      res.status(500).json({
+        error: 'An unexpected error occurred while analyzing the lab report.',
+        details: error.message,
+      });
     }
-
-    // Heuristic clinical fallback if Gemini key is missing or prompt failed
-    if (!analysisResult) {
-      analysisResult = generateFallbackMedicalAnalysis(base64Data, cleanPincode);
-    }
-
-    // Ensure extracted symptom keyword exists
-    const extractedSymptom = analysisResult.symptom || 'General Biomarker Elevation';
-    const extractedSeverity = analysisResult.severity || 'moderate';
-    const extractedCategory = analysisResult.category || 'General Health';
-    const confidenceScore = analysisResult.confidenceScore || 0.94;
-    const createdAt = new Date().toISOString();
-
-    // Persist to Firestore
-    const firestoreRecord = {
-      pincode: cleanPincode,
-      symptom: extractedSymptom,
-      category: extractedCategory,
-      severity: extractedSeverity,
-      lat: location.lat,
-      lng: location.lng,
-      regionName: `${location.city}, ${location.state}`,
-      confidenceScore,
-      createdAt,
-    };
-
-    const docId = await saveToFirestoreRest(firestoreRecord);
-
-    res.json({
-      success: true,
-      docId,
-      explanation: analysisResult,
-      surveillanceRecord: {
-        id: docId || `loc-${Date.now()}`,
-        ...firestoreRecord,
-      },
-    });
-  } catch (error: any) {
-    console.error('API Error in /api/analyze-report:', error);
-    res.status(500).json({
-      error: 'An unexpected error occurred while analyzing the lab report.',
-      details: error.message,
-    });
   }
-});
+);
 
-/**
- * Endpoint to fetch recent surveillance reports for the Admin Dashboard
- */
-apiApp.get('/api/symptom-reports', async (_req: Request, res: Response): Promise<void> => {
+// -------------------------------------------------------------
+// 5. High-Speed Surveillance / Signals Route with Caching
+// -------------------------------------------------------------
+
+async function fetchSurveillanceSignals(): Promise<any[]> {
   try {
     const { projectId, firestoreDatabaseId, apiKey } = firebaseConfig;
-    const url = `https://firestore.googleapis.com/v1/projects/${projectId}/databases/${firestoreDatabaseId}/documents/symptom_reports?key=${apiKey}&pageSize=50`;
+    const url = `https://firestore.googleapis.com/v1/projects/${projectId}/databases/${firestoreDatabaseId}/documents/symptom_reports?key=${apiKey}&pageSize=100`;
 
     const response = await fetch(url);
     if (response.ok) {
@@ -250,26 +355,238 @@ apiApp.get('/api/symptom-reports', async (_req: Request, res: Response): Promise
         };
       });
 
-      // Merge with seed reports
       const combined = [
         ...firestoreDocs,
-        ...SEED_SURVEILLANCE_REPORTS.filter((s) => !firestoreDocs.some((f: any) => f.pincode === s.pincode && f.symptom === s.symptom)),
+        ...SEED_SURVEILLANCE_REPORTS.filter(
+          (s) => !firestoreDocs.some((f: any) => f.pincode === s.pincode && f.symptom === s.symptom)
+        ),
       ];
-
-      res.json({ reports: combined });
-    } else {
-      res.json({ reports: SEED_SURVEILLANCE_REPORTS });
+      return combined;
     }
   } catch (err) {
     console.warn('Error reading from Firestore REST, using seed surveillance dataset:', err);
-    res.json({ reports: SEED_SURVEILLANCE_REPORTS });
   }
-});
+  return SEED_SURVEILLANCE_REPORTS;
+}
 
 /**
- * Intelligent clinical fallback analyzer if Gemini API key is absent or quota is constrained
+ * Endpoint for high-performance Leaflet surveillance mapping.
+ * Provides both /api/signals and /api/symptom-reports with in-memory caching.
  */
-function generateFallbackMedicalAnalysis(base64Str: string, pincode: string) {
+const handleSignalsRequest = async (req: Request, res: Response): Promise<void> => {
+  const now = Date.now();
+
+  // Return cached result if fresh (< 25s)
+  if (surveillanceCache && now - surveillanceCache.timestamp < CACHE_TTL_MS) {
+    if (req.headers['if-none-match'] === surveillanceCache.etag) {
+      res.status(304).end();
+      return;
+    }
+    res.setHeader('ETag', surveillanceCache.etag);
+    res.setHeader('Cache-Control', 'public, max-age=25');
+    res.setHeader('X-Cache', 'HIT');
+    res.json({
+      reports: surveillanceCache.data,
+      signals: surveillanceCache.data,
+      totalCount: surveillanceCache.data.length,
+      cached: true,
+      timestamp: surveillanceCache.timestamp,
+    });
+    return;
+  }
+
+  // Cache miss: fetch and store
+  const freshData = await fetchSurveillanceSignals();
+  const etag = `W/"signals-${freshData.length}-${now}"`;
+  surveillanceCache = {
+    data: freshData,
+    timestamp: now,
+    etag,
+  };
+
+  res.setHeader('ETag', etag);
+  res.setHeader('Cache-Control', 'public, max-age=25');
+  res.setHeader('X-Cache', 'MISS');
+  res.json({
+    reports: freshData,
+    signals: freshData,
+    totalCount: freshData.length,
+    cached: false,
+    timestamp: now,
+  });
+};
+
+apiApp.get('/api/signals', signalsRateLimiter, handleSignalsRequest);
+apiApp.get('/api/symptom-reports', signalsRateLimiter, handleSignalsRequest);
+
+// -------------------------------------------------------------
+// 6. Symptom Health Chat Endpoint
+// -------------------------------------------------------------
+
+apiApp.post(
+  '/api/symptom-chat',
+  chatRateLimiter,
+  async (req: Request, res: Response): Promise<void> => {
+    try {
+      const { message, history = [], reportContext, pincode, targetLanguage = 'en' } = req.body;
+
+      if (!message || typeof message !== 'string') {
+        res.status(400).json({ error: 'A message describing your symptoms or feelings is required.' });
+        return;
+      }
+
+      if (message.length > 3000) {
+        res.status(400).json({ error: 'Message exceeds maximum allowed length (3000 characters).' });
+        return;
+      }
+
+      const ai = getGeminiClient();
+      let replyText = '';
+      let extractedSymptom = '';
+      let extractedSeverity: 'low' | 'moderate' | 'high' | 'critical' = 'moderate';
+      let extractedCategory = 'General Health';
+
+      let contextPrompt = '';
+      if (reportContext) {
+        contextPrompt = `
+PATIENT RECENT LAB REPORT CONTEXT:
+- Test: ${reportContext.title || 'Laboratory Panel'}
+- Key Findings: ${JSON.stringify(reportContext.keyFindings || [])}
+- Overall Translation: ${reportContext.summary || ''}
+- Extracted Symptom: ${reportContext.symptom || ''}
+If the patient's symptoms relate to these laboratory results, explicitly correlate their physical feelings with these specific biomarkers!
+`;
+      }
+
+      const langMap: Record<string, string> = {
+        en: 'English',
+        te: 'Telugu (తెలుగు)',
+        hi: 'Hindi (हिन्दी)',
+        ta: 'Tamil (தமிழ்)',
+      };
+      const requestedLangName = langMap[targetLanguage] || 'English';
+
+      if (ai) {
+        try {
+          const systemInstruction = `You are Sentinel Health's compassionate Clinical Health Educator and Symptom Assistant.
+Your mission is to listen to the user describing how they feel physically, validate their experience with empathy, explain what might be happening physiologically in clear, accessible plain language, and help them prepare for a clinical visit.
+
+LANGUAGE: Please respond in ${requestedLangName}.
+
+Follow this structure in your response:
+1. **Empathy & Validation**: Acknowledge how they are feeling in a comforting, professional manner.
+2. **What Might Be Happening**: Provide 2-3 plausible physiological explanations in simple language.
+3. **Lab Correlation**: If lab report context is provided, connect their symptoms directly to their lab values.
+4. **When to Seek Immediate Care (Red Flags)**: List 2-3 specific emergency signs that mean they should go to urgent care or the ER.
+5. **Practical At-Home Comfort Measures**: Safe, non-pharmacological comfort steps (hydration, rest, gentle movement).
+6. **Questions for Your Doctor**: 2-3 concise questions to ask at their next appointment.
+
+At the very end of your response, on a new line, include a hidden extraction block formatted exactly like:
+<!--EXTRACT:{"symptom":"Short Symptom Keyword (3-6 words)","severity":"low|moderate|high|critical","category":"Metabolic|Hematology|Cardiovascular|Hepatic|Immunology|General"}-->
+`;
+
+          const formattedContents: any[] = [];
+          for (const item of history.slice(-6)) {
+            formattedContents.push({
+              role: item.role === 'model' ? 'model' : 'user',
+              parts: [{ text: item.text }],
+            });
+          }
+
+          const userPrompt = `${contextPrompt}\n\nPATIENT STATES:\n"${message}"`;
+          formattedContents.push({
+            role: 'user',
+            parts: [{ text: userPrompt }],
+          });
+
+          const response = await ai.models.generateContent({
+            model: 'gemini-3.8-flash',
+            contents: formattedContents,
+            config: {
+              systemInstruction,
+              temperature: 0.7,
+            },
+          });
+
+          const rawReply = response.text || '';
+          const match = rawReply.match(/<!--EXTRACT:(.*?)-->/);
+          if (match) {
+            try {
+              const parsed = JSON.parse(match[1]);
+              extractedSymptom = parsed.symptom || '';
+              extractedSeverity = parsed.severity || 'moderate';
+              extractedCategory = parsed.category || 'General Health';
+            } catch {
+              // ignore JSON parse error
+            }
+            replyText = rawReply.replace(/<!--EXTRACT:(.*?)-->/, '').trim();
+          } else {
+            replyText = rawReply.trim();
+          }
+        } catch (geminiErr) {
+          console.warn('Gemini chat error, using clinical fallback:', geminiErr);
+        }
+      }
+
+      // Fallback response if Gemini API key is unavailable
+      if (!replyText) {
+        replyText = generateFallbackChatResponse(message, targetLanguage);
+        extractedSymptom = 'Fatigue & Metabolic Strain';
+        extractedSeverity = 'moderate';
+        extractedCategory = 'Metabolic';
+      }
+
+      let savedDocId = null;
+      if (pincode && pincode.length === 6 && extractedSymptom) {
+        const loc = getPincodeLocation(pincode);
+        savedDocId = await saveToFirestoreRest({
+          pincode,
+          symptom: extractedSymptom,
+          category: extractedCategory,
+          severity: extractedSeverity,
+          lat: loc.lat,
+          lng: loc.lng,
+          regionName: `${loc.city}, ${loc.state}`,
+          confidenceScore: 0.95,
+          createdAt: new Date().toISOString(),
+        });
+      }
+
+      res.json({
+        reply: replyText,
+        extractedSymptom,
+        severity: extractedSeverity,
+        category: extractedCategory,
+        savedDocId,
+      });
+    } catch (error: any) {
+      console.error('Error in /api/symptom-chat:', error);
+      res.status(500).json({
+        error: 'An unexpected error occurred during symptom consultation.',
+        details: error.message,
+      });
+    }
+  }
+);
+
+// -------------------------------------------------------------
+// 7. Clinical Fallback Generators (Multi-Language Aware)
+// -------------------------------------------------------------
+
+function generateFallbackChatResponse(message: string, lang: string): string {
+  if (lang === 'te') {
+    return `నేను మీ పరిస్థితిని అర్థం చేసుకున్నాను. మీరు పేర్కొన్న లక్షణాలు శరీరం అలసట లేదా జీవక్రియ ఒత్తిడికి గురవుతుందని సూచిస్తున్నాయి.\n\n### ఏమి జరుగుతుండవచ్చు:\n- **రక్తంలో చక్కెర మార్పులు**: శరీరంలో శక్తి సమతుల్యత మారినప్పుడు నీరసం లేదా కళ్లు తిరగడం రావచ్చు.\n- **ద్రవాల లోపం**: తగినంత నీరు తాగకపోవడం వల్ల రక్త ప్రసరణ మందగించవచ్చు.\n\n### ఇంటి వద్ద జాగ్రత్తలు:\n1. రోజుకు తగినంత మంచినీరు లేదా కొబ్బరినీళ్లు తాగండి.\n2. విశ్రాంతి తీసుకోండి మరియు సమయానికి పౌష్టికాహారం తినండి.\n\n### అత్యవసర సంకేతాలు:\nఛాతీలో నొప్పి, తీవ్రమైన శ్వాస ఆడకపోవడం లేదా స్పృహ తప్పడం ఉంటే వెంటనే అత్యవసర వైద్య సహాయం పొందండి.`;
+  }
+  if (lang === 'hi') {
+    return `मैं आपकी स्थिति समझ सकता हूँ। आपके लक्षण शरीर में ऊर्जा की कमी या मेटाबॉलिक असंतुलन की ओर संकेत करते हैं।\n\n### संभावित कारण:\n- **ब्लड शुगर में उतार-चढ़ाव**: भोजन के बाद थकान या चक्कर आना शुगर संतुलन में बदलाव का संकेत हो सकता है।\n- **डिहाइड्रेशन (पानी की कमी)**: पर्याप्त पानी न पीने से भी कमजोरी महसूस होती है।\n\n### घरेलू सुझाव:\n1. दिनभर पर्याप्त पानी और इलेक्ट्रोलाइट्स का सेवन करें।\n2. समय पर पौष्टिक भोजन लें और पूरी नींद लें।\n\n### चेतावनी के लक्षण:\nसीने में तेज दर्द, सांस लेने में अत्यधिक कठिनाई या बेहोशी होने पर तुरंत नजदीकी अस्पताल में संपर्क करें।`;
+  }
+  if (lang === 'ta') {
+    return `உங்கள் உடல் நிலையை நான் புரிந்துகொள்கிறேன். நீங்கள் கூறும் அறிகுறிகள் உடலில் ஆற்றல் குறைவு அல்லது நீர்ச்சத்து குறைபாட்டை குறிக்கலாம்.\n\n### என்ன நடக்கிறது:\n- **இரத்த சர்க்கரை அளவுகளில் மாற்றம்**: சர்க்கரை அளவு மாறுபடும் போது சோர்வு அல்லது தலைச்சுற்றல் ஏற்படலாம்.\n- **நீர்ச்சத்து பற்றாக்குறை**: போதுமான நீர் குடிக்காதது சோர்வை அதிகரிக்கும்.\n\n### எளிய ஆலோசனைகள்:\n1. போதுமான அளவு நீர் மற்றும் இளநீர் அருந்துங்கள்.\n2. சரியான நேரத்திற்கு சத்தான உணவை உட்கொள்ளுங்கள்.\n\n### எச்சரிக்கை அறிகுறிகள்:\nமார்பு வலி, மூச்சுத் திணறல் அல்லது மயக்கம் ஏற்பட்டால் உடனடியாக மருத்துவரை அணுகவும்.`;
+  }
+  return `I understand how draining these physical sensations can feel. When fatigue or dizziness occurs, your body is communicating that cellular fuel or hydration may be constrained.\n\n### What Might Be Happening\n- **Glycemic Fluctuation**: Changes in blood sugar after meals can lead to sudden energy drops.\n- **Hydration & Electrolytes**: Mild fluid depletion reduces blood volume and brain perfusion.\n\n### Practical Comfort Steps\n1. Sip electrolyte water throughout the day.\n2. Eat balanced meals combining fiber, protein, and complex carbohydrates.\n\n### Red Flag Signs\nSeek immediate emergency evaluation if you develop chest tightness, syncope (fainting), or sudden shortness of breath.`;
+}
+
+function generateFallbackMedicalAnalysis(base64Str: string, _pincode: string, lang = 'en') {
   let decodedText = '';
   try {
     decodedText = Buffer.from(base64Str.slice(0, 5000), 'base64').toString('utf-8');
@@ -278,11 +595,84 @@ function generateFallbackMedicalAnalysis(base64Str: string, pincode: string) {
   }
 
   const isGlucose = decodedText.includes('Glucose') || decodedText.includes('HbA1c') || decodedText.includes('Diabet');
-  const isCbc = decodedText.includes('Leukocyte') || decodedText.includes('WBC') || decodedText.includes('Neutrophil');
-  const isLipid = decodedText.includes('Cholesterol') || decodedText.includes('LDL') || decodedText.includes('Triglyceride');
-  const isLiver = decodedText.includes('ALT') || decodedText.includes('AST') || decodedText.includes('Bilirubin') || decodedText.includes('Hepatic');
+  const isLiver = decodedText.includes('ALT') || decodedText.includes('AST') || decodedText.includes('Bilirubin');
 
   if (isGlucose) {
+    if (lang === 'te') {
+      return {
+        title: "గ్లైసెమిక్ ప్రొఫైల్ & డయాబెటిస్ మూల్యాంకనం",
+        summary: "మీ నివేదికలో బ్లడ్ గ్లూకోజ్ మరియు HbA1c స్థాయిలు సాధారణం కంటే ఎక్కువగా ఉన్నాయి. ఇది శరీరం చక్కెరను సమర్థవంతంగా ప్రాసెస్ చేయలేకపోతుందని సూచిస్తుంది.",
+        symptom: "హైపర్‌గ్లైసీమియా / డయాబెటిస్ సంకేతం",
+        category: "Metabolic",
+        severity: "high",
+        confidenceScore: 0.97,
+        keyFindings: [
+          { parameter: "Fasting Blood Glucose", value: "178.0 mg/dL", referenceRange: "70 - 99 mg/dL", status: "Elevated", interpretation: "సాధారణ ఉపవాస పరిమితి కంటే ఎక్కువ." },
+          { parameter: "HbA1c (Glycated Hemoglobin)", value: "8.6%", referenceRange: "< 5.7%", status: "Elevated", interpretation: "గత 3 నెలల సగటు చక్కెర ఎక్కువ ఉందని తెలుపుతుంది." }
+        ],
+        whatItMeans: "గ్లూకోజ్ పెరిగినప్పుడు కణాలకు తగినంత శక్తి అందక అలసట, దాహం పెరగడం వంటి లక్షణాలు కనిపిస్తాయి. జీవనశైలి మార్పులు మరియు వైద్యుల సలహాతో దీనిని నియంత్రించవచ్చు.",
+        questionsForDoctor: [
+          "నా ఫాస్టింగ్ షుగర్ లక్ష్యం ఎంత ఉండాలి?",
+          "ఆహార నియమాలు మరియు మందుల గురించి వివరాలు తెలపండి?",
+          "మళ్లీ ఎప్పుడు HbA1c పరీక్ష చేయించాలి?"
+        ],
+        lifestyleGuidance: [
+          "భోజనం తర్వాత 15 నిమిషాల నడకను అలవాటు చేసుకోండి.",
+          "పీచు పదార్థాలు మరియు ఆకుకూరలు ఎక్కువగా తీసుకోండి."
+        ],
+        disclaimer: "ఈ నివేదిక కేవలం అవగాహన కోసం మాత్రమే. దయచేసి మీ వైద్యుడిని సంప్రదించండి."
+      };
+    }
+    if (lang === 'hi') {
+      return {
+        title: "ग्लाइसेमिक प्रोफाइल एवं मधुमेह परीक्षण",
+        summary: "आपकी रिपोर्ट में ब्लड ग्लूकोज और एचबीए1सी (HbA1c) का स्तर सामान्य सीमा से अधिक है, जो इंसुलिन प्रतिरोध या मधुमेह की ओर संकेत करता है।",
+        symptom: "हाइपरग्लाइसीमिया / डायबिटीज जोखिम",
+        category: "Metabolic",
+        severity: "high",
+        confidenceScore: 0.97,
+        keyFindings: [
+          { parameter: "Fasting Blood Glucose", value: "178.0 mg/dL", referenceRange: "70 - 99 mg/dL", status: "Elevated", interpretation: "सामान्य फास्टिंग स्तर से काफी अधिक।" },
+          { parameter: "HbA1c (Glycated Hemoglobin)", value: "8.6%", referenceRange: "< 5.7%", status: "Elevated", interpretation: "पिछले 3 महीनों के औसत ब्लड शुगर में वृद्धि।" }
+        ],
+        whatItMeans: "जब रक्त में शर्करा बढ़ती है तो शरीर की कोशिकाओं को पर्याप्त ऊर्जा नहीं मिल पाती। उचित खान-पान और डॉक्टर की सलाह से इसे नियंत्रित किया जा सकता है।",
+        questionsForDoctor: [
+          "मेरे फास्टिंग ब्लड शुगर का आदर्श लक्ष्य क्या होना चाहिए?",
+          "क्या अभी दवा शुरू करने की आवश्यकता है या केवल आहार नियंत्रण?",
+          "दोबारा टेस्ट कब कराना चाहिए?"
+        ],
+        lifestyleGuidance: [
+          "भोजन के बाद 15 मिनट की हल्की सैर जरूर करें।",
+          "मीठे पेय पदार्थों और रिफाइंड कार्ब्स से परहेज करें।"
+        ],
+        disclaimer: "यह रिपोर्ट केवल शैक्षिक जानकारी हेतु है। अपने डॉक्टर से परामर्श अवश्य लें।"
+      };
+    }
+    if (lang === 'ta') {
+      return {
+        title: "இரத்த சர்க்கரை மற்றும் நீரிழிவு மதிப்பீடு",
+        summary: "உங்கள் ஆய்வக அறிக்கையில் குளுக்கோஸ் மற்றும் HbA1c அளவுகள் பரிந்துரைக்கப்பட்ட வரம்பை விட அதிகமாக உள்ளன.",
+        symptom: "இரத்தத்தில் அதிக சர்க்கரை / நீரிழிவு",
+        category: "Metabolic",
+        severity: "high",
+        confidenceScore: 0.97,
+        keyFindings: [
+          { parameter: "Fasting Blood Glucose", value: "178.0 mg/dL", referenceRange: "70 - 99 mg/dL", status: "Elevated", interpretation: "இயல்பான அளவை விட கூடுதல் சர்க்கரை." },
+          { parameter: "HbA1c (Glycated Hemoglobin)", value: "8.6%", referenceRange: "< 5.7%", status: "Elevated", interpretation: "கடந்த 3 மாதங்களின் சராசரி சர்க்கரை உயர்வு." }
+        ],
+        whatItMeans: "இரத்தத்தில் சர்க்கரை அளவு அதிகரிக்கும் போது உடல் எளிதில் சோர்வடையும். சரியான உணவு மற்றும் உடற்பயிற்சி மூலம் இதனை கட்டுப்படுத்தலாம்.",
+        questionsForDoctor: [
+          "எனது இரத்த சர்க்கரை இலக்கு என்னவாக இருக்க வேண்டும்?",
+          "உணவு முறை மற்றும் மருந்து பரிந்துரைகள் என்ன?"
+        ],
+        lifestyleGuidance: [
+          "உணவுக்குப் பிறகு 15 நிமிடங்கள் நடைப்பயிற்சி செய்யுங்கள்.",
+          "நார்ச்சத்து நிறைந்த காய்கறிகளை உணவில் சேர்த்துக் கொள்ளுங்கள்."
+        ],
+        disclaimer: "இது மருத்துவ ஆலோசனை அல்ல. மருத்துவரை அணுகவும்."
+      };
+    }
+
     return {
       title: "Glycemic Profile & Diabetes Evaluation",
       summary: "Your report indicates elevated blood glucose and glycated hemoglobin (HbA1c) levels. This suggests your body is having trouble processing sugars efficiently, typical of insulin resistance or type-2 diabetes.",
@@ -292,308 +682,44 @@ function generateFallbackMedicalAnalysis(base64Str: string, pincode: string) {
       confidenceScore: 0.97,
       keyFindings: [
         { parameter: "Fasting Blood Glucose", value: "178.0 mg/dL", referenceRange: "70 - 99 mg/dL", status: "Elevated", interpretation: "Significantly higher than optimal fasting baseline." },
-        { parameter: "HbA1c (Glycated Hemoglobin)", value: "8.6%", referenceRange: "< 5.7%", status: "Elevated", interpretation: "Reflects elevated average blood sugar over the last 3 months." },
-        { parameter: "Serum Creatinine", value: "0.92 mg/dL", referenceRange: "0.7 - 1.2 mg/dL", status: "Normal", interpretation: "Kidney filtration function remains in the healthy range." },
-        { parameter: "Microalbumin / Creatinine Ratio", value: "38.5 mg/g", referenceRange: "< 30 mg/g", status: "Elevated", interpretation: "Slight trace protein, an early sign to protect kidney wellness." }
+        { parameter: "HbA1c (Glycated Hemoglobin)", value: "8.6%", referenceRange: "< 5.7%", status: "Elevated", interpretation: "Reflects elevated average blood sugar over the last 3 months." }
       ],
-      whatItMeans: "When glucose stays elevated, sugar remains in your bloodstream instead of fueling your cells. You might experience fatigue, increased thirst, or frequent urination. The great news is that blood sugar responds very effectively to guided nutrition, physical activity, and medical support.",
+      whatItMeans: "When glucose stays elevated, sugar remains in your bloodstream instead of fueling your cells. You might experience fatigue, increased thirst, or frequent urination.",
       questionsForDoctor: [
         "What target range should I aim for with my fasting blood sugar?",
         "Should we initiate medication or focus on medical nutrition therapy first?",
-        "How often should we repeat my HbA1c to monitor progress?",
-        "Do you recommend a continuous glucose monitor (CGM) or fingerstick tests?"
+        "How often should we repeat my HbA1c to monitor progress?"
       ],
       lifestyleGuidance: [
         "Incorporate a 15-minute gentle walk immediately after meals to facilitate glucose uptake.",
-        "Emphasize whole fiber, leafy greens, and lean proteins while minimizing refined carbohydrates and sodas.",
-        "Stay well-hydrated throughout the day with filtered water.",
-        "Ensure 7 to 8 hours of consistent, restful sleep to help balance cortisol and insulin."
+        "Emphasize whole fiber, leafy greens, and lean proteins while minimizing refined carbohydrates.",
+        "Stay well-hydrated throughout the day with filtered water."
       ],
       disclaimer: "This report summary is educational and does not constitute a formal prescription or diagnosis. Please consult your physician."
     };
   }
 
-  if (isLiver) {
-    return {
-      title: "Hepatic Function & Liver Enzyme Panel",
-      summary: "Your liver enzymes (ALT and AST) are markedly elevated above the standard range. This signifies active liver inflammation or cell irritation that requires prompt medical evaluation.",
-      symptom: "Acute Hepatocellular Injury / High Transaminases",
-      category: "Hepatic",
-      severity: "critical",
-      confidenceScore: 0.96,
-      keyFindings: [
-        { parameter: "ALT (SGPT)", value: "340.0 U/L", referenceRange: "5 - 45 U/L", status: "Critical", interpretation: "High enzyme release into blood reflecting liver strain." },
-        { parameter: "AST (SGOT)", value: "295.0 U/L", referenceRange: "5 - 35 U/L", status: "Critical", interpretation: "Supports hepatocellular inflammation." },
-        { parameter: "Total Bilirubin", value: "3.2 mg/dL", referenceRange: "0.2 - 1.2 mg/dL", status: "Elevated", interpretation: "Bile pigment retention, may cause mild jaundice or fatigue." },
-        { parameter: "Serum Albumin", value: "3.9 g/dL", referenceRange: "3.5 - 5.0 g/dL", status: "Normal", interpretation: "Liver synthetic protein capacity is currently preserved." }
-      ],
-      whatItMeans: "The liver is remarkably resilient and can regenerate rapidly once the underlying irritation (such as a viral infection, medication reaction, or fatty accumulation) is addressed with a physician.",
-      questionsForDoctor: [
-        "Do we need a viral hepatitis screen or abdominal ultrasound?",
-        "Are any of my current medications or supplements straining my liver?",
-        "When should we re-check these enzyme levels to confirm recovery?"
-      ],
-      lifestyleGuidance: [
-        "Strictly avoid all alcohol consumption until enzymes normalize.",
-        "Avoid over-the-counter pain relievers (especially acetaminophen/paracetamol) unless prescribed.",
-        "Maintain a light, easily digestible diet rich in antioxidants."
-      ],
-      disclaimer: "This educational report should be reviewed immediately with your gastroenterologist or primary care physician."
-    };
-  }
-
-  if (isCbc) {
-    return {
-      title: "Complete Blood Count & Inflammatory Screen",
-      summary: "Your white blood cell count and neutrophils are significantly elevated, which is your immune system's standard response when fighting off an active infection or inflammation.",
-      symptom: "Leukocytosis / Acute Bacterial Infection",
-      category: "Hematology",
-      severity: "high",
-      confidenceScore: 0.95,
-      keyFindings: [
-        { parameter: "White Blood Cells (WBC)", value: "16,800 /μL", referenceRange: "4,000 - 11,000", status: "Elevated", interpretation: "Immune defense mobilization against an infection." },
-        { parameter: "Neutrophils", value: "82.0%", referenceRange: "40 - 70%", status: "Elevated", interpretation: "Left-shift typical of bacterial defense." },
-        { parameter: "Hemoglobin", value: "13.8 g/dL", referenceRange: "13.0 - 17.0", status: "Normal", interpretation: "Healthy oxygen-carrying capacity." },
-        { parameter: "C-Reactive Protein (CRP)", value: "24.6 mg/L", referenceRange: "< 3.0", status: "Elevated", interpretation: "Confirmative marker of systemic inflammatory response." }
-      ],
-      whatItMeans: "Your body is actively defending itself. If you have symptoms like fever, chills, sore throat, or localized pain, this lab clarifies why your body feels fatigued.",
-      questionsForDoctor: [
-        "Do these results warrant a course of antibiotics or supportive antiviral care?",
-        "Should we perform a culture (throat, urine, or sputum) to identify the pathogen?",
-        "What warning signs should prompt me to seek urgent care?"
-      ],
-      lifestyleGuidance: [
-        "Prioritize complete bed rest and allow your immune system to focus energy on healing.",
-        "Drink warm fluids, soups, and electrolyte solutions.",
-        "Monitor your body temperature twice daily."
-      ],
-      disclaimer: "Please present this report to your physician for appropriate antimicrobial or symptomatic treatment."
-    };
-  }
-
-  // Default general health / lipid profile fallback
+  // Default cardiovascular / metabolic panel
   return {
     title: "Cardiovascular Lipid & Metabolic Profile",
-    summary: "Your lipid profile reveals elevated levels of total cholesterol and LDL ('bad') cholesterol. While your protective HDL is slightly low, proactive dietary and lifestyle steps can make a dramatic positive difference.",
+    summary: "Your lipid profile reveals elevated levels of total cholesterol and LDL ('bad') cholesterol. Proactive dietary and lifestyle steps can make a dramatic positive difference.",
     symptom: "Hypercholesterolemia / High Atherogenic Risk",
     category: "Cardiovascular",
     severity: "moderate",
     confidenceScore: 0.93,
     keyFindings: [
       { parameter: "Total Cholesterol", value: "264.0 mg/dL", referenceRange: "< 200 mg/dL", status: "Elevated", interpretation: "Above recommended threshold for optimal arterial health." },
-      { parameter: "LDL ('Bad') Cholesterol", value: "182.0 mg/dL", referenceRange: "< 100 mg/dL", status: "Elevated", interpretation: "Primary target for cardiovascular risk reduction." },
-      { parameter: "HDL ('Good') Cholesterol", value: "36.0 mg/dL", referenceRange: "> 40 mg/dL", status: "Low", interpretation: "Lower protective HDL level, can be boosted with exercise." },
-      { parameter: "Triglycerides", value: "215.0 mg/dL", referenceRange: "< 150 mg/dL", status: "Elevated", interpretation: "Circulating blood fats influenced by refined sugars and starches." }
+      { parameter: "LDL ('Bad') Cholesterol", value: "182.0 mg/dL", referenceRange: "< 100 mg/dL", status: "Elevated", interpretation: "Primary target for cardiovascular risk reduction." }
     ],
-    whatItMeans: "Elevated LDL cholesterol can slowly deposit along blood vessel walls over time. The encouraging fact is that cholesterol metrics respond promptly to heart-healthy fats, soluble fiber, and regular cardiovascular exercise.",
+    whatItMeans: "Elevated LDL cholesterol can slowly deposit along blood vessel walls. The encouraging fact is that cholesterol metrics respond promptly to heart-healthy fats, soluble fiber, and regular cardiovascular exercise.",
     questionsForDoctor: [
       "What is my overall 10-year cardiovascular risk score?",
-      "Would a low-dose lipid-lowering medication (statin) be beneficial for me?",
       "Can we trial 3 months of focused dietary changes before deciding on medication?"
     ],
     lifestyleGuidance: [
       "Incorporate soluble fiber such as steel-cut oats, chia seeds, and legumes daily.",
-      "Replace saturated butter and palm oils with extra-virgin olive oil and nuts.",
-      "Engage in 30 minutes of moderate aerobic activity (brisk walking, cycling) 5 days a week."
+      "Engage in 30 minutes of moderate aerobic activity 5 days a week."
     ],
     disclaimer: "Educational analysis only. Please discuss with your cardiologist or primary care doctor."
   };
 }
-
-/**
- * Symptom Health Chat endpoint where the user can describe how they feel
- * and AI explains what is happening physiologically, correlates with lab data,
- * suggests potential causes, warning signs, and doctor questions.
- */
-apiApp.post('/api/symptom-chat', async (req: Request, res: Response): Promise<void> => {
-  try {
-    const { message, history = [], reportContext, pincode } = req.body;
-
-    if (!message || typeof message !== 'string') {
-      res.status(400).json({ error: 'A message describing your symptoms or feelings is required.' });
-      return;
-    }
-
-    const ai = getGeminiClient();
-    let replyText = '';
-    let extractedSymptom = '';
-    let extractedSeverity: 'low' | 'moderate' | 'high' | 'critical' = 'moderate';
-    let extractedCategory = 'General Health';
-
-    let contextPrompt = '';
-    if (reportContext) {
-      contextPrompt = `
-PATIENT RECENT LAB REPORT CONTEXT:
-- Test: ${reportContext.title || 'Laboratory Panel'}
-- Key Findings: ${JSON.stringify(reportContext.keyFindings || [])}
-- Overall Translation: ${reportContext.summary || ''}
-- Extracted Symptom: ${reportContext.symptom || ''}
-If the patient's symptoms relate to these laboratory results, explicitly correlate their physical feelings with these specific biomarkers!
-`;
-    }
-
-    if (ai) {
-      try {
-        const systemInstruction = `You are Sentinel Health's compassionate Clinical Health Educator and Symptom Assistant.
-Your mission is to listen to the user describing how they feel physically, validate their experience with empathy, explain what might be happening physiologically in clear, accessible plain language, and help them prepare for a clinical visit.
-
-Follow this structure in your response:
-1. **Empathy & Validation**: Acknowledge how they are feeling in a comforting, professional manner.
-2. **What Might Be Happening**: Provide 2-3 plausible physiological explanations in simple, everyday language (e.g., how dehydration, blood sugar fluctuations, viral responses, or electrolyte shifts affect the body). Always frame these as possibilities to explore, not definitive diagnoses.
-3. **Lab Correlation**: If lab report context is provided, connect their symptoms directly to their lab values.
-4. **When to Seek Immediate Care (Red Flags)**: List 2-3 specific emergency signs that mean they should go to urgent care or the ER immediately.
-5. **Practical At-Home Comfort Measures**: Safe, non-pharmacological comfort steps (hydration, rest, gentle movement, dietary adjustments).
-6. **Questions for Your Doctor**: 2-3 concise questions to ask at their next appointment.
-
-At the very end of your response, on a new line, include a hidden extraction block formatted exactly like:
-<!--EXTRACT:{"symptom":"Short Symptom Keyword (3-6 words)","severity":"low|moderate|high|critical","category":"Metabolic|Hematology|Cardiovascular|Hepatic|Immunology|General"}-->
-`;
-
-        // Format previous turns for context
-        const formattedContents: any[] = [];
-        for (const item of history.slice(-6)) {
-          formattedContents.push({
-            role: item.role === 'model' ? 'model' : 'user',
-            parts: [{ text: item.text }],
-          });
-        }
-
-        // Add current user prompt with context
-        const userPrompt = `${contextPrompt}\n\nPATIENT STATES:\n"${message}"`;
-        formattedContents.push({
-          role: 'user',
-          parts: [{ text: userPrompt }],
-        });
-
-        const response = await ai.models.generateContent({
-          model: 'gemini-3.8-flash',
-          contents: formattedContents,
-          config: {
-            systemInstruction,
-            temperature: 0.7,
-          },
-        });
-
-        const rawReply = response.text || '';
-        
-        // Extract the hidden metadata tag
-        const match = rawReply.match(/<!--EXTRACT:(.*?)-->/);
-        if (match) {
-          try {
-            const parsed = JSON.parse(match[1]);
-            extractedSymptom = parsed.symptom || '';
-            extractedSeverity = parsed.severity || 'moderate';
-            extractedCategory = parsed.category || 'General Health';
-          } catch {
-            // ignore JSON parse error
-          }
-          replyText = rawReply.replace(/<!--EXTRACT:(.*?)-->/, '').trim();
-        } else {
-          replyText = rawReply.trim();
-        }
-      } catch (geminiErr) {
-        console.warn('Gemini chat error, using clinical fallback:', geminiErr);
-      }
-    }
-
-    // Heuristic fallback if Gemini API is unavailable
-    if (!replyText) {
-      const lower = message.toLowerCase();
-      if (lower.includes('tired') || lower.includes('fatigue') || lower.includes('exhausted') || lower.includes('dizzy')) {
-        extractedSymptom = 'Fatigue / Lethargy & Dizziness';
-        extractedSeverity = 'moderate';
-        extractedCategory = 'Metabolic';
-        replyText = `I understand how draining constant fatigue and dizziness can feel. When your energy drops suddenly or persists over days, your body is communicating that its cellular fuel or oxygen delivery may be constrained.
-
-### What Might Be Happening
-- **Cellular Energy / Glycemic Imbalance**: Blood sugar swings (either drops after high-carb meals or sustained highs where glucose cannot enter cells) can starve muscles and brain tissue of ready fuel.
-- **Oxygen Transport**: Low hemoglobin or iron reserves (anemia) directly reduces oxygen delivery to vital tissues, leading to brain fog and heavy limbs.
-- **Hydration & Electrolytes**: Even mild dehydration (or low sodium/potassium) reduces circulating blood volume, leading to lightheadedness upon standing.
-
-### Practical Comfort Steps
-1. Sip water with electrolytes or coconut water throughout the day.
-2. Avoid skipping meals; include protein with complex carbohydrates.
-3. Rest with legs slightly elevated if dizziness occurs.
-
-### Red Flag Symptoms
-Seek prompt medical care if you experience chest tightness, fainting (syncope), sudden weakness on one side, or shortness of breath at rest.
-
-### Questions for Your Doctor
-- "Should we check my complete blood count (CBC), iron panel, and thyroid levels?"
-- "Could my current medications or sleep quality be contributing to this fatigue?"`;
-      } else if (lower.includes('stomach') || lower.includes('nausea') || lower.includes('pain') || lower.includes('digest')) {
-        extractedSymptom = 'Gastric Discomfort / Nausea';
-        extractedSeverity = 'moderate';
-        extractedCategory = 'Hepatic';
-        replyText = `Dealing with stomach discomfort and nausea is very uncomfortable. Your gastrointestinal tract is lined with sensitive nerve endings and immune cells that react quickly to irritation or dietary stress.
-
-### What Might Be Happening
-- **Gastric Acidity or Mucosal Irritation**: Increased stomach acid production or gastritis can cause a gnawing, burning sensation.
-- **Biliary or Liver Strain**: Sluggish bile flow or elevated liver transaminases can make digesting rich foods or fats trigger nausea.
-- **Gut Motility Response**: Stress or mild gastrointestinal infection can alter peristalsis, causing cramping and queasiness.
-
-### Practical Comfort Steps
-1. Eat small, bland meals (crackers, oats, bananas, boiled rice) rather than large portions.
-2. Avoid caffeine, alcohol, acidic citrus, and spicy or greasy foods.
-3. Sip warm ginger or chamomile tea.
-
-### Red Flag Symptoms
-Seek emergency medical evaluation if you vomit blood, have black tarry stools, experience sudden excruciating abdominal pain, or cannot keep liquids down for over 12 hours.
-
-### Questions for Your Doctor
-- "Do you recommend testing for H. pylori or evaluating my liver and gallbladder function?"
-- "Would an acid reducer or probiotic be appropriate for me?"`;
-      } else {
-        extractedSymptom = 'General Somatic Discomfort';
-        extractedSeverity = 'low';
-        extractedCategory = 'General Health';
-        replyText = `Thank you for sharing how you are feeling. Physical symptoms are often interconnected signals from your body asking for rest, nutritional balance, or clinical evaluation.
-
-### What Might Be Happening
-- **Immune or Inflammatory Activation**: Mild systemic inflammation, early viral defense, or stress can produce aches, mild malaise, or temperature changes.
-- **Metabolic Strain**: Changes in physical activity, hydration, or sleep hygiene directly impact how your nervous and cardiovascular systems regulate sensations.
-
-### Comfort Recommendations
-- Stay well hydrated and aim for 8 hours of restorative rest.
-- Keep a brief daily symptom log noting what times of day symptoms peak.
-
-### Red Flag Signs
-Seek immediate emergency medical care if you develop high fever, difficulty breathing, chest pressure, severe unrelenting pain, or confusion.
-
-*Disclaimer: This is educational guidance powered by Sentinel Health AI and does not replace professional medical evaluation.*`;
-      }
-    }
-
-    // If pincode is provided, save the newly extracted symptom to Firestore surveillance
-    let savedDocId = null;
-    if (pincode && pincode.length === 6 && extractedSymptom) {
-      const loc = getPincodeLocation(pincode);
-      savedDocId = await saveToFirestoreRest({
-        pincode,
-        symptom: extractedSymptom,
-        category: extractedCategory,
-        severity: extractedSeverity,
-        lat: loc.lat,
-        lng: loc.lng,
-        regionName: `${loc.city}, ${loc.state}`,
-        confidenceScore: 0.95,
-        createdAt: new Date().toISOString(),
-      });
-    }
-
-    res.json({
-      reply: replyText,
-      extractedSymptom,
-      severity: extractedSeverity,
-      category: extractedCategory,
-      savedDocId,
-    });
-  } catch (error: any) {
-    console.error('Error in /api/symptom-chat:', error);
-    res.status(500).json({
-      error: 'An unexpected error occurred during symptom consultation.',
-      details: error.message,
-    });
-  }
-});
-

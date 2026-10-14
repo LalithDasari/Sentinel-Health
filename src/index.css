@@ -38,6 +38,89 @@
   border: none !important;
 }
 
+/* Pulsing radar waves for high-impact surveillance map */
+@keyframes pulse-ring-critical {
+  0% {
+    transform: scale(0.6);
+    opacity: 0.85;
+  }
+  50% {
+    opacity: 0.45;
+  }
+  100% {
+    transform: scale(2.4);
+    opacity: 0;
+  }
+}
+
+@keyframes pulse-ring-high {
+  0% {
+    transform: scale(0.7);
+    opacity: 0.75;
+  }
+  50% {
+    opacity: 0.35;
+  }
+  100% {
+    transform: scale(2.0);
+    opacity: 0;
+  }
+}
+
+@keyframes pulse-ring-moderate {
+  0% {
+    transform: scale(0.8);
+    opacity: 0.6;
+  }
+  100% {
+    transform: scale(1.6);
+    opacity: 0;
+  }
+}
+
+.pulse-critical {
+  animation: pulse-ring-critical 2s cubic-bezier(0.2, 0.8, 0.2, 1) infinite;
+}
+
+.pulse-high {
+  animation: pulse-ring-high 2.4s cubic-bezier(0.2, 0.8, 0.2, 1) infinite;
+}
+
+.pulse-moderate {
+  animation: pulse-ring-moderate 2.8s cubic-bezier(0.2, 0.8, 0.2, 1) infinite;
+}
+
+/* WCAG 2.1 High Contrast Mode overrides */
+.high-contrast-mode {
+  --tw-bg-opacity: 1 !important;
+  background-color: #000000 !important;
+  color: #ffffff !important;
+}
+
+.high-contrast-mode .bg-white,
+.high-contrast-mode .bg-slate-50,
+.high-contrast-mode .bg-slate-100 {
+  background-color: #0a0a0a !important;
+  color: #ffffff !important;
+  border-color: #ffffff !important;
+}
+
+.high-contrast-mode .text-slate-600,
+.high-contrast-mode .text-slate-500,
+.high-contrast-mode .text-slate-700 {
+  color: #f0f0f0 !important;
+}
+
+.high-contrast-mode a,
+.high-contrast-mode button {
+  outline-color: #facc15 !important;
+}
+
+.high-contrast-mode :focus-visible {
+  outline: 3px solid #facc15 !important;
+  outline-offset: 3px !important;
+}
+
 /* Custom Scrollbar for dark mode feed */
 ::-webkit-scrollbar {
   width: 6px;

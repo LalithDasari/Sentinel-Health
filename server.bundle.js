@@ -319,7 +319,51 @@ var SEED_SURVEILLANCE_REPORTS = [
 
 // server/apiApp.ts
 var apiApp = express();
-apiApp.use(express.json({ limit: "20mb" }));
+apiApp.use(express.json({ limit: "15mb" }));
+var rateLimitStore = /* @__PURE__ */ new Map();
+function createRateLimiter(maxTokens, refillIntervalMs) {
+  return (req, res, next) => {
+    const rawIp = req.headers["x-forwarded-for"] || req.socket.remoteAddress || "anonymous";
+    const clientIp = rawIp.split(",")[0].trim();
+    const now = Date.now();
+    let bucket = rateLimitStore.get(clientIp);
+    if (!bucket) {
+      bucket = { tokens: maxTokens, lastRefill: now };
+      rateLimitStore.set(clientIp, bucket);
+    } else {
+      const elapsed = now - bucket.lastRefill;
+      const tokensToAdd = Math.floor(elapsed / refillIntervalMs) * maxTokens;
+      if (tokensToAdd > 0) {
+        bucket.tokens = Math.min(maxTokens, bucket.tokens + tokensToAdd);
+        bucket.lastRefill = now;
+      }
+    }
+    if (bucket.tokens <= 0) {
+      const retryAfter = Math.ceil(refillIntervalMs / 1e3);
+      res.setHeader("Retry-After", retryAfter.toString());
+      res.setHeader("X-RateLimit-Limit", maxTokens.toString());
+      res.setHeader("X-RateLimit-Remaining", "0");
+      res.status(429).json({
+        error: "Too Many Requests: Rate limit exceeded.",
+        message: "Sentinel Health rate-limiting triggered to protect model quotas and backend stability.",
+        retryAfterSeconds: retryAfter
+      });
+      return;
+    }
+    bucket.tokens -= 1;
+    res.setHeader("X-RateLimit-Limit", maxTokens.toString());
+    res.setHeader("X-RateLimit-Remaining", bucket.tokens.toString());
+    next();
+  };
+}
+var reportRateLimiter = createRateLimiter(25, 6e4);
+var chatRateLimiter = createRateLimiter(40, 6e4);
+var signalsRateLimiter = createRateLimiter(120, 6e4);
+var surveillanceCache = null;
+var CACHE_TTL_MS = 25e3;
+function invalidateSignalsCache() {
+  surveillanceCache = null;
+}
 function getGeminiClient() {
   const apiKey = process.env.GEMINI_API_KEY;
   if (!apiKey) {
@@ -358,6 +402,7 @@ async function saveToFirestoreRest(record) {
     });
     if (res.ok) {
       const data = await res.json();
+      invalidateSignalsCache();
       const docName = data.name || "";
       return docName.split("/").pop() || null;
     } else {
@@ -370,45 +415,65 @@ async function saveToFirestoreRest(record) {
     return null;
   }
 }
-apiApp.post("/api/analyze-report", async (req, res) => {
-  try {
-    const { image, mimeType = "image/jpeg", pincode } = req.body;
-    if (!image) {
-      res.status(400).json({ error: "Lab report image is required." });
-      return;
-    }
-    const cleanPincode = (pincode || "").replace(/\D/g, "").slice(0, 6);
-    if (cleanPincode.length !== 6) {
-      res.status(400).json({ error: "A valid 6-digit postal code (pincode) is required." });
-      return;
-    }
-    const location = getPincodeLocation(cleanPincode);
-    let base64Data = image;
-    let resolvedMimeType = mimeType;
-    if (image.startsWith("data:")) {
-      const match = image.match(/^data:([^;]+);base64,(.+)$/);
-      if (match) {
-        resolvedMimeType = match[1];
-        base64Data = match[2];
-      } else {
-        const plainMatch = image.match(/^data:([^,]+),(.*)$/);
-        if (plainMatch) {
-          resolvedMimeType = plainMatch[1].split(";")[0];
-          base64Data = Buffer.from(decodeURIComponent(plainMatch[2])).toString("base64");
+apiApp.post(
+  "/api/analyze-report",
+  reportRateLimiter,
+  async (req, res) => {
+    try {
+      const { image, mimeType = "image/jpeg", pincode, targetLanguage = "en" } = req.body;
+      if (!image || typeof image !== "string") {
+        res.status(400).json({ error: "Valid lab report image payload is required." });
+        return;
+      }
+      if (image.length > 20 * 1024 * 1024) {
+        res.status(413).json({ error: "Payload exceeds maximum allowed size (15MB)." });
+        return;
+      }
+      const cleanPincode = (pincode || "").replace(/\D/g, "").slice(0, 6);
+      if (!/^[1-9][0-9]{5}$/.test(cleanPincode)) {
+        res.status(400).json({
+          error: "A valid 6-digit Indian postal code (pincode starting with 1-9) is required."
+        });
+        return;
+      }
+      const validLanguages = ["en", "te", "hi", "ta"];
+      const lang = validLanguages.includes(targetLanguage) ? targetLanguage : "en";
+      const location = getPincodeLocation(cleanPincode);
+      let base64Data = image;
+      let resolvedMimeType = mimeType;
+      if (image.startsWith("data:")) {
+        const match = image.match(/^data:([^;]+);base64,(.+)$/);
+        if (match) {
+          resolvedMimeType = match[1];
+          base64Data = match[2];
+        } else {
+          const plainMatch = image.match(/^data:([^,]+),(.*)$/);
+          if (plainMatch) {
+            resolvedMimeType = plainMatch[1].split(";")[0];
+            base64Data = Buffer.from(decodeURIComponent(plainMatch[2])).toString("base64");
+          }
         }
       }
-    }
-    const ai = getGeminiClient();
-    let analysisResult = null;
-    if (ai) {
-      try {
-        const prompt = `You are Sentinel Health, an expert pathologist and empathetic clinical health educator.
-Analyze this medical lab test report image thoroughly.
+      const ai = getGeminiClient();
+      let analysisResult = null;
+      const languageInstructions = {
+        en: "Explain all findings, summary, interpretation, questions, and guidance in clear, comforting plain English.",
+        te: "Explain the summary, whatItMeans, questionsForDoctor, lifestyleGuidance, and parameter interpretations in fluent, natural Telugu script (\u0C24\u0C46\u0C32\u0C41\u0C17\u0C41), while keeping parameter names in English.",
+        hi: "Explain the summary, whatItMeans, questionsForDoctor, lifestyleGuidance, and parameter interpretations in natural, comforting Hindi Devanagari script (\u0939\u093F\u0928\u094D\u0926\u0940), while keeping parameter names in English.",
+        ta: "Explain the summary, whatItMeans, questionsForDoctor, lifestyleGuidance, and parameter interpretations in clear, accessible Tamil script (\u0BA4\u0BAE\u0BBF\u0BB4\u0BCD), while keeping parameter names in English."
+      };
+      if (ai) {
+        try {
+          const prompt = `You are Sentinel Health, an expert pathologist and empathetic clinical health educator.
+Analyze this medical lab test report image thoroughly. Notice that personal identifiers (PII) may have been redacted on the client side for patient privacy.
 
-Provide your output strictly in valid JSON matching this structure:
+LANGUAGE REQUIREMENT:
+${languageInstructions[lang] || languageInstructions.en}
+
+Provide your output strictly in valid JSON matching this schema:
 {
-  "title": "Clear diagnostic panel title (e.g. Glycemic Evaluation & Diabetic Risk Panel)",
-  "summary": "2-3 conversational, reassuring sentences explaining the overall picture in plain English without medical jargon.",
+  "title": "Clear diagnostic panel title",
+  "summary": "2-3 conversational, reassuring sentences explaining the overall picture without medical jargon.",
   "symptom": "Short extracted clinical finding or symptom keyword (max 8 words, e.g. 'Hyperglycemia / Elevated Glucose' or 'Leukocytosis / Bacterial Infection' or 'Hypercholesterolemia' or 'Normal Biomarkers')",
   "category": "Metabolic" | "Hematology" | "Cardiovascular" | "Hepatic" | "Renal" | "Endocrine" | "Immunology" | "General Health",
   "severity": "low" | "moderate" | "high" | "critical",
@@ -422,82 +487,84 @@ Provide your output strictly in valid JSON matching this structure:
       "interpretation": "1 simple sentence explaining what this specific number indicates."
     }
   ],
-  "whatItMeans": "A friendly paragraph translating what these results mean for the patient's body, energy, and day-to-day health.",
+  "whatItMeans": "A friendly paragraph translating what these results mean for the patient's body and day-to-day health.",
   "questionsForDoctor": [
-    "3 to 4 specific, actionable questions the patient should ask their primary care doctor during their consultation."
+    "3 to 4 specific, actionable questions the patient should ask their primary care doctor."
   ],
   "lifestyleGuidance": [
     "3 to 4 practical, non-prescriptive daily habits, dietary tips, or lifestyle follow-ups."
   ],
   "disclaimer": "This analysis is an AI-generated educational summary designed to help you prepare for a conversation with your healthcare provider. It is not an official medical diagnosis or prescription."
 }`;
-        const response = await ai.models.generateContent({
-          model: "gemini-3.8-flash",
-          contents: [
-            {
-              inlineData: {
-                mimeType: resolvedMimeType.includes("svg") ? "image/png" : resolvedMimeType,
-                data: base64Data
-              }
-            },
-            { text: prompt }
-          ],
-          config: {
-            responseMimeType: "application/json"
+          const response = await ai.models.generateContent({
+            model: "gemini-3.8-flash",
+            contents: [
+              {
+                inlineData: {
+                  mimeType: resolvedMimeType.includes("svg") ? "image/png" : resolvedMimeType,
+                  data: base64Data
+                }
+              },
+              { text: prompt }
+            ],
+            config: {
+              responseMimeType: "application/json"
+            }
+          });
+          const rawText = response.text || "";
+          try {
+            analysisResult = JSON.parse(rawText.trim());
+          } catch {
+            const cleaned = rawText.replace(/```json/g, "").replace(/```/g, "").trim();
+            analysisResult = JSON.parse(cleaned);
           }
-        });
-        const rawText = response.text || "";
-        try {
-          analysisResult = JSON.parse(rawText.trim());
-        } catch {
-          const cleaned = rawText.replace(/```json/g, "").replace(/```/g, "").trim();
-          analysisResult = JSON.parse(cleaned);
+        } catch (geminiErr) {
+          console.warn("Gemini vision model fallback triggered:", geminiErr);
         }
-      } catch (geminiErr) {
-        console.warn("Gemini vision model fallback triggered:", geminiErr);
       }
-    }
-    if (!analysisResult) {
-      analysisResult = generateFallbackMedicalAnalysis(base64Data, cleanPincode);
-    }
-    const extractedSymptom = analysisResult.symptom || "General Biomarker Elevation";
-    const extractedSeverity = analysisResult.severity || "moderate";
-    const extractedCategory = analysisResult.category || "General Health";
-    const confidenceScore = analysisResult.confidenceScore || 0.94;
-    const createdAt = (/* @__PURE__ */ new Date()).toISOString();
-    const firestoreRecord = {
-      pincode: cleanPincode,
-      symptom: extractedSymptom,
-      category: extractedCategory,
-      severity: extractedSeverity,
-      lat: location.lat,
-      lng: location.lng,
-      regionName: `${location.city}, ${location.state}`,
-      confidenceScore,
-      createdAt
-    };
-    const docId = await saveToFirestoreRest(firestoreRecord);
-    res.json({
-      success: true,
-      docId,
-      explanation: analysisResult,
-      surveillanceRecord: {
-        id: docId || `loc-${Date.now()}`,
-        ...firestoreRecord
+      if (!analysisResult) {
+        analysisResult = generateFallbackMedicalAnalysis(base64Data, cleanPincode, lang);
       }
-    });
-  } catch (error) {
-    console.error("API Error in /api/analyze-report:", error);
-    res.status(500).json({
-      error: "An unexpected error occurred while analyzing the lab report.",
-      details: error.message
-    });
+      const extractedSymptom = analysisResult.symptom || "General Biomarker Elevation";
+      const extractedSeverity = analysisResult.severity || "moderate";
+      const extractedCategory = analysisResult.category || "General Health";
+      const confidenceScore = analysisResult.confidenceScore || 0.94;
+      const createdAt = (/* @__PURE__ */ new Date()).toISOString();
+      const firestoreRecord = {
+        pincode: cleanPincode,
+        symptom: extractedSymptom,
+        category: extractedCategory,
+        severity: extractedSeverity,
+        lat: location.lat,
+        lng: location.lng,
+        regionName: `${location.city}, ${location.state}`,
+        confidenceScore,
+        createdAt
+      };
+      const docId = await saveToFirestoreRest(firestoreRecord);
+      res.json({
+        success: true,
+        docId,
+        explanation: analysisResult,
+        language: lang,
+        surveillanceRecord: {
+          id: docId || `loc-${Date.now()}`,
+          ...firestoreRecord
+        }
+      });
+    } catch (error) {
+      console.error("API Error in /api/analyze-report:", error);
+      res.status(500).json({
+        error: "An unexpected error occurred while analyzing the lab report.",
+        details: error.message
+      });
+    }
   }
-});
-apiApp.get("/api/symptom-reports", async (_req, res) => {
+);
+async function fetchSurveillanceSignals() {
   try {
     const { projectId, firestoreDatabaseId, apiKey } = firebase_applet_config_default;
-    const url = `https://firestore.googleapis.com/v1/projects/${projectId}/databases/${firestoreDatabaseId}/documents/symptom_reports?key=${apiKey}&pageSize=50`;
+    const url = `https://firestore.googleapis.com/v1/projects/${projectId}/databases/${firestoreDatabaseId}/documents/symptom_reports?key=${apiKey}&pageSize=100`;
     const response = await fetch(url);
     if (response.ok) {
       const data = await response.json();
@@ -518,18 +585,246 @@ apiApp.get("/api/symptom-reports", async (_req, res) => {
       });
       const combined = [
         ...firestoreDocs,
-        ...SEED_SURVEILLANCE_REPORTS.filter((s) => !firestoreDocs.some((f) => f.pincode === s.pincode && f.symptom === s.symptom))
+        ...SEED_SURVEILLANCE_REPORTS.filter(
+          (s) => !firestoreDocs.some((f) => f.pincode === s.pincode && f.symptom === s.symptom)
+        )
       ];
-      res.json({ reports: combined });
-    } else {
-      res.json({ reports: SEED_SURVEILLANCE_REPORTS });
+      return combined;
     }
   } catch (err) {
     console.warn("Error reading from Firestore REST, using seed surveillance dataset:", err);
-    res.json({ reports: SEED_SURVEILLANCE_REPORTS });
   }
-});
-function generateFallbackMedicalAnalysis(base64Str, pincode) {
+  return SEED_SURVEILLANCE_REPORTS;
+}
+var handleSignalsRequest = async (req, res) => {
+  const now = Date.now();
+  if (surveillanceCache && now - surveillanceCache.timestamp < CACHE_TTL_MS) {
+    if (req.headers["if-none-match"] === surveillanceCache.etag) {
+      res.status(304).end();
+      return;
+    }
+    res.setHeader("ETag", surveillanceCache.etag);
+    res.setHeader("Cache-Control", "public, max-age=25");
+    res.setHeader("X-Cache", "HIT");
+    res.json({
+      reports: surveillanceCache.data,
+      signals: surveillanceCache.data,
+      totalCount: surveillanceCache.data.length,
+      cached: true,
+      timestamp: surveillanceCache.timestamp
+    });
+    return;
+  }
+  const freshData = await fetchSurveillanceSignals();
+  const etag = `W/"signals-${freshData.length}-${now}"`;
+  surveillanceCache = {
+    data: freshData,
+    timestamp: now,
+    etag
+  };
+  res.setHeader("ETag", etag);
+  res.setHeader("Cache-Control", "public, max-age=25");
+  res.setHeader("X-Cache", "MISS");
+  res.json({
+    reports: freshData,
+    signals: freshData,
+    totalCount: freshData.length,
+    cached: false,
+    timestamp: now
+  });
+};
+apiApp.get("/api/signals", signalsRateLimiter, handleSignalsRequest);
+apiApp.get("/api/symptom-reports", signalsRateLimiter, handleSignalsRequest);
+apiApp.post(
+  "/api/symptom-chat",
+  chatRateLimiter,
+  async (req, res) => {
+    try {
+      const { message, history = [], reportContext, pincode, targetLanguage = "en" } = req.body;
+      if (!message || typeof message !== "string") {
+        res.status(400).json({ error: "A message describing your symptoms or feelings is required." });
+        return;
+      }
+      if (message.length > 3e3) {
+        res.status(400).json({ error: "Message exceeds maximum allowed length (3000 characters)." });
+        return;
+      }
+      const ai = getGeminiClient();
+      let replyText = "";
+      let extractedSymptom = "";
+      let extractedSeverity = "moderate";
+      let extractedCategory = "General Health";
+      let contextPrompt = "";
+      if (reportContext) {
+        contextPrompt = `
+PATIENT RECENT LAB REPORT CONTEXT:
+- Test: ${reportContext.title || "Laboratory Panel"}
+- Key Findings: ${JSON.stringify(reportContext.keyFindings || [])}
+- Overall Translation: ${reportContext.summary || ""}
+- Extracted Symptom: ${reportContext.symptom || ""}
+If the patient's symptoms relate to these laboratory results, explicitly correlate their physical feelings with these specific biomarkers!
+`;
+      }
+      const langMap = {
+        en: "English",
+        te: "Telugu (\u0C24\u0C46\u0C32\u0C41\u0C17\u0C41)",
+        hi: "Hindi (\u0939\u093F\u0928\u094D\u0926\u0940)",
+        ta: "Tamil (\u0BA4\u0BAE\u0BBF\u0BB4\u0BCD)"
+      };
+      const requestedLangName = langMap[targetLanguage] || "English";
+      if (ai) {
+        try {
+          const systemInstruction = `You are Sentinel Health's compassionate Clinical Health Educator and Symptom Assistant.
+Your mission is to listen to the user describing how they feel physically, validate their experience with empathy, explain what might be happening physiologically in clear, accessible plain language, and help them prepare for a clinical visit.
+
+LANGUAGE: Please respond in ${requestedLangName}.
+
+Follow this structure in your response:
+1. **Empathy & Validation**: Acknowledge how they are feeling in a comforting, professional manner.
+2. **What Might Be Happening**: Provide 2-3 plausible physiological explanations in simple language.
+3. **Lab Correlation**: If lab report context is provided, connect their symptoms directly to their lab values.
+4. **When to Seek Immediate Care (Red Flags)**: List 2-3 specific emergency signs that mean they should go to urgent care or the ER.
+5. **Practical At-Home Comfort Measures**: Safe, non-pharmacological comfort steps (hydration, rest, gentle movement).
+6. **Questions for Your Doctor**: 2-3 concise questions to ask at their next appointment.
+
+At the very end of your response, on a new line, include a hidden extraction block formatted exactly like:
+<!--EXTRACT:{"symptom":"Short Symptom Keyword (3-6 words)","severity":"low|moderate|high|critical","category":"Metabolic|Hematology|Cardiovascular|Hepatic|Immunology|General"}-->
+`;
+          const formattedContents = [];
+          for (const item of history.slice(-6)) {
+            formattedContents.push({
+              role: item.role === "model" ? "model" : "user",
+              parts: [{ text: item.text }]
+            });
+          }
+          const userPrompt = `${contextPrompt}
+
+PATIENT STATES:
+"${message}"`;
+          formattedContents.push({
+            role: "user",
+            parts: [{ text: userPrompt }]
+          });
+          const response = await ai.models.generateContent({
+            model: "gemini-3.8-flash",
+            contents: formattedContents,
+            config: {
+              systemInstruction,
+              temperature: 0.7
+            }
+          });
+          const rawReply = response.text || "";
+          const match = rawReply.match(/<!--EXTRACT:(.*?)-->/);
+          if (match) {
+            try {
+              const parsed = JSON.parse(match[1]);
+              extractedSymptom = parsed.symptom || "";
+              extractedSeverity = parsed.severity || "moderate";
+              extractedCategory = parsed.category || "General Health";
+            } catch {
+            }
+            replyText = rawReply.replace(/<!--EXTRACT:(.*?)-->/, "").trim();
+          } else {
+            replyText = rawReply.trim();
+          }
+        } catch (geminiErr) {
+          console.warn("Gemini chat error, using clinical fallback:", geminiErr);
+        }
+      }
+      if (!replyText) {
+        replyText = generateFallbackChatResponse(message, targetLanguage);
+        extractedSymptom = "Fatigue & Metabolic Strain";
+        extractedSeverity = "moderate";
+        extractedCategory = "Metabolic";
+      }
+      let savedDocId = null;
+      if (pincode && pincode.length === 6 && extractedSymptom) {
+        const loc = getPincodeLocation(pincode);
+        savedDocId = await saveToFirestoreRest({
+          pincode,
+          symptom: extractedSymptom,
+          category: extractedCategory,
+          severity: extractedSeverity,
+          lat: loc.lat,
+          lng: loc.lng,
+          regionName: `${loc.city}, ${loc.state}`,
+          confidenceScore: 0.95,
+          createdAt: (/* @__PURE__ */ new Date()).toISOString()
+        });
+      }
+      res.json({
+        reply: replyText,
+        extractedSymptom,
+        severity: extractedSeverity,
+        category: extractedCategory,
+        savedDocId
+      });
+    } catch (error) {
+      console.error("Error in /api/symptom-chat:", error);
+      res.status(500).json({
+        error: "An unexpected error occurred during symptom consultation.",
+        details: error.message
+      });
+    }
+  }
+);
+function generateFallbackChatResponse(message, lang) {
+  if (lang === "te") {
+    return `\u0C28\u0C47\u0C28\u0C41 \u0C2E\u0C40 \u0C2A\u0C30\u0C3F\u0C38\u0C4D\u0C25\u0C3F\u0C24\u0C3F\u0C28\u0C3F \u0C05\u0C30\u0C4D\u0C25\u0C02 \u0C1A\u0C47\u0C38\u0C41\u0C15\u0C41\u0C28\u0C4D\u0C28\u0C3E\u0C28\u0C41. \u0C2E\u0C40\u0C30\u0C41 \u0C2A\u0C47\u0C30\u0C4D\u0C15\u0C4A\u0C28\u0C4D\u0C28 \u0C32\u0C15\u0C4D\u0C37\u0C23\u0C3E\u0C32\u0C41 \u0C36\u0C30\u0C40\u0C30\u0C02 \u0C05\u0C32\u0C38\u0C1F \u0C32\u0C47\u0C26\u0C3E \u0C1C\u0C40\u0C35\u0C15\u0C4D\u0C30\u0C3F\u0C2F \u0C12\u0C24\u0C4D\u0C24\u0C3F\u0C21\u0C3F\u0C15\u0C3F \u0C17\u0C41\u0C30\u0C35\u0C41\u0C24\u0C41\u0C02\u0C26\u0C28\u0C3F \u0C38\u0C42\u0C1A\u0C3F\u0C38\u0C4D\u0C24\u0C41\u0C28\u0C4D\u0C28\u0C3E\u0C2F\u0C3F.
+
+### \u0C0F\u0C2E\u0C3F \u0C1C\u0C30\u0C41\u0C17\u0C41\u0C24\u0C41\u0C02\u0C21\u0C35\u0C1A\u0C4D\u0C1A\u0C41:
+- **\u0C30\u0C15\u0C4D\u0C24\u0C02\u0C32\u0C4B \u0C1A\u0C15\u0C4D\u0C15\u0C46\u0C30 \u0C2E\u0C3E\u0C30\u0C4D\u0C2A\u0C41\u0C32\u0C41**: \u0C36\u0C30\u0C40\u0C30\u0C02\u0C32\u0C4B \u0C36\u0C15\u0C4D\u0C24\u0C3F \u0C38\u0C2E\u0C24\u0C41\u0C32\u0C4D\u0C2F\u0C24 \u0C2E\u0C3E\u0C30\u0C3F\u0C28\u0C2A\u0C4D\u0C2A\u0C41\u0C21\u0C41 \u0C28\u0C40\u0C30\u0C38\u0C02 \u0C32\u0C47\u0C26\u0C3E \u0C15\u0C33\u0C4D\u0C32\u0C41 \u0C24\u0C3F\u0C30\u0C17\u0C21\u0C02 \u0C30\u0C3E\u0C35\u0C1A\u0C4D\u0C1A\u0C41.
+- **\u0C26\u0C4D\u0C30\u0C35\u0C3E\u0C32 \u0C32\u0C4B\u0C2A\u0C02**: \u0C24\u0C17\u0C3F\u0C28\u0C02\u0C24 \u0C28\u0C40\u0C30\u0C41 \u0C24\u0C3E\u0C17\u0C15\u0C2A\u0C4B\u0C35\u0C21\u0C02 \u0C35\u0C32\u0C4D\u0C32 \u0C30\u0C15\u0C4D\u0C24 \u0C2A\u0C4D\u0C30\u0C38\u0C30\u0C23 \u0C2E\u0C02\u0C26\u0C17\u0C3F\u0C02\u0C1A\u0C35\u0C1A\u0C4D\u0C1A\u0C41.
+
+### \u0C07\u0C02\u0C1F\u0C3F \u0C35\u0C26\u0C4D\u0C26 \u0C1C\u0C3E\u0C17\u0C4D\u0C30\u0C24\u0C4D\u0C24\u0C32\u0C41:
+1. \u0C30\u0C4B\u0C1C\u0C41\u0C15\u0C41 \u0C24\u0C17\u0C3F\u0C28\u0C02\u0C24 \u0C2E\u0C02\u0C1A\u0C3F\u0C28\u0C40\u0C30\u0C41 \u0C32\u0C47\u0C26\u0C3E \u0C15\u0C4A\u0C2C\u0C4D\u0C2C\u0C30\u0C3F\u0C28\u0C40\u0C33\u0C4D\u0C32\u0C41 \u0C24\u0C3E\u0C17\u0C02\u0C21\u0C3F.
+2. \u0C35\u0C3F\u0C36\u0C4D\u0C30\u0C3E\u0C02\u0C24\u0C3F \u0C24\u0C40\u0C38\u0C41\u0C15\u0C4B\u0C02\u0C21\u0C3F \u0C2E\u0C30\u0C3F\u0C2F\u0C41 \u0C38\u0C2E\u0C2F\u0C3E\u0C28\u0C3F\u0C15\u0C3F \u0C2A\u0C4C\u0C37\u0C4D\u0C1F\u0C3F\u0C15\u0C3E\u0C39\u0C3E\u0C30\u0C02 \u0C24\u0C3F\u0C28\u0C02\u0C21\u0C3F.
+
+### \u0C05\u0C24\u0C4D\u0C2F\u0C35\u0C38\u0C30 \u0C38\u0C02\u0C15\u0C47\u0C24\u0C3E\u0C32\u0C41:
+\u0C1B\u0C3E\u0C24\u0C40\u0C32\u0C4B \u0C28\u0C4A\u0C2A\u0C4D\u0C2A\u0C3F, \u0C24\u0C40\u0C35\u0C4D\u0C30\u0C2E\u0C48\u0C28 \u0C36\u0C4D\u0C35\u0C3E\u0C38 \u0C06\u0C21\u0C15\u0C2A\u0C4B\u0C35\u0C21\u0C02 \u0C32\u0C47\u0C26\u0C3E \u0C38\u0C4D\u0C2A\u0C43\u0C39 \u0C24\u0C2A\u0C4D\u0C2A\u0C21\u0C02 \u0C09\u0C02\u0C1F\u0C47 \u0C35\u0C46\u0C02\u0C1F\u0C28\u0C47 \u0C05\u0C24\u0C4D\u0C2F\u0C35\u0C38\u0C30 \u0C35\u0C48\u0C26\u0C4D\u0C2F \u0C38\u0C39\u0C3E\u0C2F\u0C02 \u0C2A\u0C4A\u0C02\u0C26\u0C02\u0C21\u0C3F.`;
+  }
+  if (lang === "hi") {
+    return `\u092E\u0948\u0902 \u0906\u092A\u0915\u0940 \u0938\u094D\u0925\u093F\u0924\u093F \u0938\u092E\u091D \u0938\u0915\u0924\u093E \u0939\u0942\u0901\u0964 \u0906\u092A\u0915\u0947 \u0932\u0915\u094D\u0937\u0923 \u0936\u0930\u0940\u0930 \u092E\u0947\u0902 \u090A\u0930\u094D\u091C\u093E \u0915\u0940 \u0915\u092E\u0940 \u092F\u093E \u092E\u0947\u091F\u093E\u092C\u0949\u0932\u093F\u0915 \u0905\u0938\u0902\u0924\u0941\u0932\u0928 \u0915\u0940 \u0913\u0930 \u0938\u0902\u0915\u0947\u0924 \u0915\u0930\u0924\u0947 \u0939\u0948\u0902\u0964
+
+### \u0938\u0902\u092D\u093E\u0935\u093F\u0924 \u0915\u093E\u0930\u0923:
+- **\u092C\u094D\u0932\u0921 \u0936\u0941\u0917\u0930 \u092E\u0947\u0902 \u0909\u0924\u093E\u0930-\u091A\u0922\u093C\u093E\u0935**: \u092D\u094B\u091C\u0928 \u0915\u0947 \u092C\u093E\u0926 \u0925\u0915\u093E\u0928 \u092F\u093E \u091A\u0915\u094D\u0915\u0930 \u0906\u0928\u093E \u0936\u0941\u0917\u0930 \u0938\u0902\u0924\u0941\u0932\u0928 \u092E\u0947\u0902 \u092C\u0926\u0932\u093E\u0935 \u0915\u093E \u0938\u0902\u0915\u0947\u0924 \u0939\u094B \u0938\u0915\u0924\u093E \u0939\u0948\u0964
+- **\u0921\u093F\u0939\u093E\u0907\u0921\u094D\u0930\u0947\u0936\u0928 (\u092A\u093E\u0928\u0940 \u0915\u0940 \u0915\u092E\u0940)**: \u092A\u0930\u094D\u092F\u093E\u092A\u094D\u0924 \u092A\u093E\u0928\u0940 \u0928 \u092A\u0940\u0928\u0947 \u0938\u0947 \u092D\u0940 \u0915\u092E\u091C\u094B\u0930\u0940 \u092E\u0939\u0938\u0942\u0938 \u0939\u094B\u0924\u0940 \u0939\u0948\u0964
+
+### \u0918\u0930\u0947\u0932\u0942 \u0938\u0941\u091D\u093E\u0935:
+1. \u0926\u093F\u0928\u092D\u0930 \u092A\u0930\u094D\u092F\u093E\u092A\u094D\u0924 \u092A\u093E\u0928\u0940 \u0914\u0930 \u0907\u0932\u0947\u0915\u094D\u091F\u094D\u0930\u094B\u0932\u093E\u0907\u091F\u094D\u0938 \u0915\u093E \u0938\u0947\u0935\u0928 \u0915\u0930\u0947\u0902\u0964
+2. \u0938\u092E\u092F \u092A\u0930 \u092A\u094C\u0937\u094D\u091F\u093F\u0915 \u092D\u094B\u091C\u0928 \u0932\u0947\u0902 \u0914\u0930 \u092A\u0942\u0930\u0940 \u0928\u0940\u0902\u0926 \u0932\u0947\u0902\u0964
+
+### \u091A\u0947\u0924\u093E\u0935\u0928\u0940 \u0915\u0947 \u0932\u0915\u094D\u0937\u0923:
+\u0938\u0940\u0928\u0947 \u092E\u0947\u0902 \u0924\u0947\u091C \u0926\u0930\u094D\u0926, \u0938\u093E\u0902\u0938 \u0932\u0947\u0928\u0947 \u092E\u0947\u0902 \u0905\u0924\u094D\u092F\u0927\u093F\u0915 \u0915\u0920\u093F\u0928\u093E\u0908 \u092F\u093E \u092C\u0947\u0939\u094B\u0936\u0940 \u0939\u094B\u0928\u0947 \u092A\u0930 \u0924\u0941\u0930\u0902\u0924 \u0928\u091C\u0926\u0940\u0915\u0940 \u0905\u0938\u094D\u092A\u0924\u093E\u0932 \u092E\u0947\u0902 \u0938\u0902\u092A\u0930\u094D\u0915 \u0915\u0930\u0947\u0902\u0964`;
+  }
+  if (lang === "ta") {
+    return `\u0B89\u0B99\u0BCD\u0B95\u0BB3\u0BCD \u0B89\u0B9F\u0BB2\u0BCD \u0BA8\u0BBF\u0BB2\u0BC8\u0BAF\u0BC8 \u0BA8\u0BBE\u0BA9\u0BCD \u0BAA\u0BC1\u0BB0\u0BBF\u0BA8\u0BCD\u0BA4\u0BC1\u0B95\u0BCA\u0BB3\u0BCD\u0B95\u0BBF\u0BB1\u0BC7\u0BA9\u0BCD. \u0BA8\u0BC0\u0B99\u0BCD\u0B95\u0BB3\u0BCD \u0B95\u0BC2\u0BB1\u0BC1\u0BAE\u0BCD \u0B85\u0BB1\u0BBF\u0B95\u0BC1\u0BB1\u0BBF\u0B95\u0BB3\u0BCD \u0B89\u0B9F\u0BB2\u0BBF\u0BB2\u0BCD \u0B86\u0BB1\u0BCD\u0BB1\u0BB2\u0BCD \u0B95\u0BC1\u0BB1\u0BC8\u0BB5\u0BC1 \u0B85\u0BB2\u0BCD\u0BB2\u0BA4\u0BC1 \u0BA8\u0BC0\u0BB0\u0BCD\u0B9A\u0BCD\u0B9A\u0BA4\u0BCD\u0BA4\u0BC1 \u0B95\u0BC1\u0BB1\u0BC8\u0BAA\u0BBE\u0B9F\u0BCD\u0B9F\u0BC8 \u0B95\u0BC1\u0BB1\u0BBF\u0B95\u0BCD\u0B95\u0BB2\u0BBE\u0BAE\u0BCD.
+
+### \u0B8E\u0BA9\u0BCD\u0BA9 \u0BA8\u0B9F\u0B95\u0BCD\u0B95\u0BBF\u0BB1\u0BA4\u0BC1:
+- **\u0B87\u0BB0\u0BA4\u0BCD\u0BA4 \u0B9A\u0BB0\u0BCD\u0B95\u0BCD\u0B95\u0BB0\u0BC8 \u0B85\u0BB3\u0BB5\u0BC1\u0B95\u0BB3\u0BBF\u0BB2\u0BCD \u0BAE\u0BBE\u0BB1\u0BCD\u0BB1\u0BAE\u0BCD**: \u0B9A\u0BB0\u0BCD\u0B95\u0BCD\u0B95\u0BB0\u0BC8 \u0B85\u0BB3\u0BB5\u0BC1 \u0BAE\u0BBE\u0BB1\u0BC1\u0BAA\u0B9F\u0BC1\u0BAE\u0BCD \u0BAA\u0BCB\u0BA4\u0BC1 \u0B9A\u0BCB\u0BB0\u0BCD\u0BB5\u0BC1 \u0B85\u0BB2\u0BCD\u0BB2\u0BA4\u0BC1 \u0BA4\u0BB2\u0BC8\u0B9A\u0BCD\u0B9A\u0BC1\u0BB1\u0BCD\u0BB1\u0BB2\u0BCD \u0B8F\u0BB1\u0BCD\u0BAA\u0B9F\u0BB2\u0BBE\u0BAE\u0BCD.
+- **\u0BA8\u0BC0\u0BB0\u0BCD\u0B9A\u0BCD\u0B9A\u0BA4\u0BCD\u0BA4\u0BC1 \u0BAA\u0BB1\u0BCD\u0BB1\u0BBE\u0B95\u0BCD\u0B95\u0BC1\u0BB1\u0BC8**: \u0BAA\u0BCB\u0BA4\u0BC1\u0BAE\u0BBE\u0BA9 \u0BA8\u0BC0\u0BB0\u0BCD \u0B95\u0BC1\u0B9F\u0BBF\u0B95\u0BCD\u0B95\u0BBE\u0BA4\u0BA4\u0BC1 \u0B9A\u0BCB\u0BB0\u0BCD\u0BB5\u0BC8 \u0B85\u0BA4\u0BBF\u0B95\u0BB0\u0BBF\u0B95\u0BCD\u0B95\u0BC1\u0BAE\u0BCD.
+
+### \u0B8E\u0BB3\u0BBF\u0BAF \u0B86\u0BB2\u0BCB\u0B9A\u0BA9\u0BC8\u0B95\u0BB3\u0BCD:
+1. \u0BAA\u0BCB\u0BA4\u0BC1\u0BAE\u0BBE\u0BA9 \u0B85\u0BB3\u0BB5\u0BC1 \u0BA8\u0BC0\u0BB0\u0BCD \u0BAE\u0BB1\u0BCD\u0BB1\u0BC1\u0BAE\u0BCD \u0B87\u0BB3\u0BA8\u0BC0\u0BB0\u0BCD \u0B85\u0BB0\u0BC1\u0BA8\u0BCD\u0BA4\u0BC1\u0B99\u0BCD\u0B95\u0BB3\u0BCD.
+2. \u0B9A\u0BB0\u0BBF\u0BAF\u0BBE\u0BA9 \u0BA8\u0BC7\u0BB0\u0BA4\u0BCD\u0BA4\u0BBF\u0BB1\u0BCD\u0B95\u0BC1 \u0B9A\u0BA4\u0BCD\u0BA4\u0BBE\u0BA9 \u0B89\u0BA3\u0BB5\u0BC8 \u0B89\u0B9F\u0BCD\u0B95\u0BCA\u0BB3\u0BCD\u0BB3\u0BC1\u0B99\u0BCD\u0B95\u0BB3\u0BCD.
+
+### \u0B8E\u0B9A\u0BCD\u0B9A\u0BB0\u0BBF\u0B95\u0BCD\u0B95\u0BC8 \u0B85\u0BB1\u0BBF\u0B95\u0BC1\u0BB1\u0BBF\u0B95\u0BB3\u0BCD:
+\u0BAE\u0BBE\u0BB0\u0BCD\u0BAA\u0BC1 \u0BB5\u0BB2\u0BBF, \u0BAE\u0BC2\u0B9A\u0BCD\u0B9A\u0BC1\u0BA4\u0BCD \u0BA4\u0BBF\u0BA3\u0BB1\u0BB2\u0BCD \u0B85\u0BB2\u0BCD\u0BB2\u0BA4\u0BC1 \u0BAE\u0BAF\u0B95\u0BCD\u0B95\u0BAE\u0BCD \u0B8F\u0BB1\u0BCD\u0BAA\u0B9F\u0BCD\u0B9F\u0BBE\u0BB2\u0BCD \u0B89\u0B9F\u0BA9\u0B9F\u0BBF\u0BAF\u0BBE\u0B95 \u0BAE\u0BB0\u0BC1\u0BA4\u0BCD\u0BA4\u0BC1\u0BB5\u0BB0\u0BC8 \u0B85\u0BA3\u0BC1\u0B95\u0BB5\u0BC1\u0BAE\u0BCD.`;
+  }
+  return `I understand how draining these physical sensations can feel. When fatigue or dizziness occurs, your body is communicating that cellular fuel or hydration may be constrained.
+
+### What Might Be Happening
+- **Glycemic Fluctuation**: Changes in blood sugar after meals can lead to sudden energy drops.
+- **Hydration & Electrolytes**: Mild fluid depletion reduces blood volume and brain perfusion.
+
+### Practical Comfort Steps
+1. Sip electrolyte water throughout the day.
+2. Eat balanced meals combining fiber, protein, and complex carbohydrates.
+
+### Red Flag Signs
+Seek immediate emergency evaluation if you develop chest tightness, syncope (fainting), or sudden shortness of breath.`;
+}
+function generateFallbackMedicalAnalysis(base64Str, _pincode, lang = "en") {
   let decodedText = "";
   try {
     decodedText = Buffer.from(base64Str.slice(0, 5e3), "base64").toString("utf-8");
@@ -537,10 +832,82 @@ function generateFallbackMedicalAnalysis(base64Str, pincode) {
     decodedText = "";
   }
   const isGlucose = decodedText.includes("Glucose") || decodedText.includes("HbA1c") || decodedText.includes("Diabet");
-  const isCbc = decodedText.includes("Leukocyte") || decodedText.includes("WBC") || decodedText.includes("Neutrophil");
-  const isLipid = decodedText.includes("Cholesterol") || decodedText.includes("LDL") || decodedText.includes("Triglyceride");
-  const isLiver = decodedText.includes("ALT") || decodedText.includes("AST") || decodedText.includes("Bilirubin") || decodedText.includes("Hepatic");
+  const isLiver = decodedText.includes("ALT") || decodedText.includes("AST") || decodedText.includes("Bilirubin");
   if (isGlucose) {
+    if (lang === "te") {
+      return {
+        title: "\u0C17\u0C4D\u0C32\u0C48\u0C38\u0C46\u0C2E\u0C3F\u0C15\u0C4D \u0C2A\u0C4D\u0C30\u0C4A\u0C2B\u0C48\u0C32\u0C4D & \u0C21\u0C2F\u0C3E\u0C2C\u0C46\u0C1F\u0C3F\u0C38\u0C4D \u0C2E\u0C42\u0C32\u0C4D\u0C2F\u0C3E\u0C02\u0C15\u0C28\u0C02",
+        summary: "\u0C2E\u0C40 \u0C28\u0C3F\u0C35\u0C47\u0C26\u0C3F\u0C15\u0C32\u0C4B \u0C2C\u0C4D\u0C32\u0C21\u0C4D \u0C17\u0C4D\u0C32\u0C42\u0C15\u0C4B\u0C1C\u0C4D \u0C2E\u0C30\u0C3F\u0C2F\u0C41 HbA1c \u0C38\u0C4D\u0C25\u0C3E\u0C2F\u0C3F\u0C32\u0C41 \u0C38\u0C3E\u0C27\u0C3E\u0C30\u0C23\u0C02 \u0C15\u0C02\u0C1F\u0C47 \u0C0E\u0C15\u0C4D\u0C15\u0C41\u0C35\u0C17\u0C3E \u0C09\u0C28\u0C4D\u0C28\u0C3E\u0C2F\u0C3F. \u0C07\u0C26\u0C3F \u0C36\u0C30\u0C40\u0C30\u0C02 \u0C1A\u0C15\u0C4D\u0C15\u0C46\u0C30\u0C28\u0C41 \u0C38\u0C2E\u0C30\u0C4D\u0C25\u0C35\u0C02\u0C24\u0C02\u0C17\u0C3E \u0C2A\u0C4D\u0C30\u0C3E\u0C38\u0C46\u0C38\u0C4D \u0C1A\u0C47\u0C2F\u0C32\u0C47\u0C15\u0C2A\u0C4B\u0C24\u0C41\u0C02\u0C26\u0C28\u0C3F \u0C38\u0C42\u0C1A\u0C3F\u0C38\u0C4D\u0C24\u0C41\u0C02\u0C26\u0C3F.",
+        symptom: "\u0C39\u0C48\u0C2A\u0C30\u0C4D\u200C\u0C17\u0C4D\u0C32\u0C48\u0C38\u0C40\u0C2E\u0C3F\u0C2F\u0C3E / \u0C21\u0C2F\u0C3E\u0C2C\u0C46\u0C1F\u0C3F\u0C38\u0C4D \u0C38\u0C02\u0C15\u0C47\u0C24\u0C02",
+        category: "Metabolic",
+        severity: "high",
+        confidenceScore: 0.97,
+        keyFindings: [
+          { parameter: "Fasting Blood Glucose", value: "178.0 mg/dL", referenceRange: "70 - 99 mg/dL", status: "Elevated", interpretation: "\u0C38\u0C3E\u0C27\u0C3E\u0C30\u0C23 \u0C09\u0C2A\u0C35\u0C3E\u0C38 \u0C2A\u0C30\u0C3F\u0C2E\u0C3F\u0C24\u0C3F \u0C15\u0C02\u0C1F\u0C47 \u0C0E\u0C15\u0C4D\u0C15\u0C41\u0C35." },
+          { parameter: "HbA1c (Glycated Hemoglobin)", value: "8.6%", referenceRange: "< 5.7%", status: "Elevated", interpretation: "\u0C17\u0C24 3 \u0C28\u0C46\u0C32\u0C32 \u0C38\u0C17\u0C1F\u0C41 \u0C1A\u0C15\u0C4D\u0C15\u0C46\u0C30 \u0C0E\u0C15\u0C4D\u0C15\u0C41\u0C35 \u0C09\u0C02\u0C26\u0C28\u0C3F \u0C24\u0C46\u0C32\u0C41\u0C2A\u0C41\u0C24\u0C41\u0C02\u0C26\u0C3F." }
+        ],
+        whatItMeans: "\u0C17\u0C4D\u0C32\u0C42\u0C15\u0C4B\u0C1C\u0C4D \u0C2A\u0C46\u0C30\u0C3F\u0C17\u0C3F\u0C28\u0C2A\u0C4D\u0C2A\u0C41\u0C21\u0C41 \u0C15\u0C23\u0C3E\u0C32\u0C15\u0C41 \u0C24\u0C17\u0C3F\u0C28\u0C02\u0C24 \u0C36\u0C15\u0C4D\u0C24\u0C3F \u0C05\u0C02\u0C26\u0C15 \u0C05\u0C32\u0C38\u0C1F, \u0C26\u0C3E\u0C39\u0C02 \u0C2A\u0C46\u0C30\u0C17\u0C21\u0C02 \u0C35\u0C02\u0C1F\u0C3F \u0C32\u0C15\u0C4D\u0C37\u0C23\u0C3E\u0C32\u0C41 \u0C15\u0C28\u0C3F\u0C2A\u0C3F\u0C38\u0C4D\u0C24\u0C3E\u0C2F\u0C3F. \u0C1C\u0C40\u0C35\u0C28\u0C36\u0C48\u0C32\u0C3F \u0C2E\u0C3E\u0C30\u0C4D\u0C2A\u0C41\u0C32\u0C41 \u0C2E\u0C30\u0C3F\u0C2F\u0C41 \u0C35\u0C48\u0C26\u0C4D\u0C2F\u0C41\u0C32 \u0C38\u0C32\u0C39\u0C3E\u0C24\u0C4B \u0C26\u0C40\u0C28\u0C3F\u0C28\u0C3F \u0C28\u0C3F\u0C2F\u0C02\u0C24\u0C4D\u0C30\u0C3F\u0C02\u0C1A\u0C35\u0C1A\u0C4D\u0C1A\u0C41.",
+        questionsForDoctor: [
+          "\u0C28\u0C3E \u0C2B\u0C3E\u0C38\u0C4D\u0C1F\u0C3F\u0C02\u0C17\u0C4D \u0C37\u0C41\u0C17\u0C30\u0C4D \u0C32\u0C15\u0C4D\u0C37\u0C4D\u0C2F\u0C02 \u0C0E\u0C02\u0C24 \u0C09\u0C02\u0C21\u0C3E\u0C32\u0C3F?",
+          "\u0C06\u0C39\u0C3E\u0C30 \u0C28\u0C3F\u0C2F\u0C2E\u0C3E\u0C32\u0C41 \u0C2E\u0C30\u0C3F\u0C2F\u0C41 \u0C2E\u0C02\u0C26\u0C41\u0C32 \u0C17\u0C41\u0C30\u0C3F\u0C02\u0C1A\u0C3F \u0C35\u0C3F\u0C35\u0C30\u0C3E\u0C32\u0C41 \u0C24\u0C46\u0C32\u0C2A\u0C02\u0C21\u0C3F?",
+          "\u0C2E\u0C33\u0C4D\u0C32\u0C40 \u0C0E\u0C2A\u0C4D\u0C2A\u0C41\u0C21\u0C41 HbA1c \u0C2A\u0C30\u0C40\u0C15\u0C4D\u0C37 \u0C1A\u0C47\u0C2F\u0C3F\u0C02\u0C1A\u0C3E\u0C32\u0C3F?"
+        ],
+        lifestyleGuidance: [
+          "\u0C2D\u0C4B\u0C1C\u0C28\u0C02 \u0C24\u0C30\u0C4D\u0C35\u0C3E\u0C24 15 \u0C28\u0C3F\u0C2E\u0C3F\u0C37\u0C3E\u0C32 \u0C28\u0C21\u0C15\u0C28\u0C41 \u0C05\u0C32\u0C35\u0C3E\u0C1F\u0C41 \u0C1A\u0C47\u0C38\u0C41\u0C15\u0C4B\u0C02\u0C21\u0C3F.",
+          "\u0C2A\u0C40\u0C1A\u0C41 \u0C2A\u0C26\u0C3E\u0C30\u0C4D\u0C25\u0C3E\u0C32\u0C41 \u0C2E\u0C30\u0C3F\u0C2F\u0C41 \u0C06\u0C15\u0C41\u0C15\u0C42\u0C30\u0C32\u0C41 \u0C0E\u0C15\u0C4D\u0C15\u0C41\u0C35\u0C17\u0C3E \u0C24\u0C40\u0C38\u0C41\u0C15\u0C4B\u0C02\u0C21\u0C3F."
+        ],
+        disclaimer: "\u0C08 \u0C28\u0C3F\u0C35\u0C47\u0C26\u0C3F\u0C15 \u0C15\u0C47\u0C35\u0C32\u0C02 \u0C05\u0C35\u0C17\u0C3E\u0C39\u0C28 \u0C15\u0C4B\u0C38\u0C02 \u0C2E\u0C3E\u0C24\u0C4D\u0C30\u0C2E\u0C47. \u0C26\u0C2F\u0C1A\u0C47\u0C38\u0C3F \u0C2E\u0C40 \u0C35\u0C48\u0C26\u0C4D\u0C2F\u0C41\u0C21\u0C3F\u0C28\u0C3F \u0C38\u0C02\u0C2A\u0C4D\u0C30\u0C26\u0C3F\u0C02\u0C1A\u0C02\u0C21\u0C3F."
+      };
+    }
+    if (lang === "hi") {
+      return {
+        title: "\u0917\u094D\u0932\u093E\u0907\u0938\u0947\u092E\u093F\u0915 \u092A\u094D\u0930\u094B\u092B\u093E\u0907\u0932 \u090F\u0935\u0902 \u092E\u0927\u0941\u092E\u0947\u0939 \u092A\u0930\u0940\u0915\u094D\u0937\u0923",
+        summary: "\u0906\u092A\u0915\u0940 \u0930\u093F\u092A\u094B\u0930\u094D\u091F \u092E\u0947\u0902 \u092C\u094D\u0932\u0921 \u0917\u094D\u0932\u0942\u0915\u094B\u091C \u0914\u0930 \u090F\u091A\u092C\u0940\u090F1\u0938\u0940 (HbA1c) \u0915\u093E \u0938\u094D\u0924\u0930 \u0938\u093E\u092E\u093E\u0928\u094D\u092F \u0938\u0940\u092E\u093E \u0938\u0947 \u0905\u0927\u093F\u0915 \u0939\u0948, \u091C\u094B \u0907\u0902\u0938\u0941\u0932\u093F\u0928 \u092A\u094D\u0930\u0924\u093F\u0930\u094B\u0927 \u092F\u093E \u092E\u0927\u0941\u092E\u0947\u0939 \u0915\u0940 \u0913\u0930 \u0938\u0902\u0915\u0947\u0924 \u0915\u0930\u0924\u093E \u0939\u0948\u0964",
+        symptom: "\u0939\u093E\u0907\u092A\u0930\u0917\u094D\u0932\u093E\u0907\u0938\u0940\u092E\u093F\u092F\u093E / \u0921\u093E\u092F\u092C\u093F\u091F\u0940\u091C \u091C\u094B\u0916\u093F\u092E",
+        category: "Metabolic",
+        severity: "high",
+        confidenceScore: 0.97,
+        keyFindings: [
+          { parameter: "Fasting Blood Glucose", value: "178.0 mg/dL", referenceRange: "70 - 99 mg/dL", status: "Elevated", interpretation: "\u0938\u093E\u092E\u093E\u0928\u094D\u092F \u092B\u093E\u0938\u094D\u091F\u093F\u0902\u0917 \u0938\u094D\u0924\u0930 \u0938\u0947 \u0915\u093E\u092B\u0940 \u0905\u0927\u093F\u0915\u0964" },
+          { parameter: "HbA1c (Glycated Hemoglobin)", value: "8.6%", referenceRange: "< 5.7%", status: "Elevated", interpretation: "\u092A\u093F\u091B\u0932\u0947 3 \u092E\u0939\u0940\u0928\u094B\u0902 \u0915\u0947 \u0914\u0938\u0924 \u092C\u094D\u0932\u0921 \u0936\u0941\u0917\u0930 \u092E\u0947\u0902 \u0935\u0943\u0926\u094D\u0927\u093F\u0964" }
+        ],
+        whatItMeans: "\u091C\u092C \u0930\u0915\u094D\u0924 \u092E\u0947\u0902 \u0936\u0930\u094D\u0915\u0930\u093E \u092C\u0922\u093C\u0924\u0940 \u0939\u0948 \u0924\u094B \u0936\u0930\u0940\u0930 \u0915\u0940 \u0915\u094B\u0936\u093F\u0915\u093E\u0913\u0902 \u0915\u094B \u092A\u0930\u094D\u092F\u093E\u092A\u094D\u0924 \u090A\u0930\u094D\u091C\u093E \u0928\u0939\u0940\u0902 \u092E\u093F\u0932 \u092A\u093E\u0924\u0940\u0964 \u0909\u091A\u093F\u0924 \u0916\u093E\u0928-\u092A\u093E\u0928 \u0914\u0930 \u0921\u0949\u0915\u094D\u091F\u0930 \u0915\u0940 \u0938\u0932\u093E\u0939 \u0938\u0947 \u0907\u0938\u0947 \u0928\u093F\u092F\u0902\u0924\u094D\u0930\u093F\u0924 \u0915\u093F\u092F\u093E \u091C\u093E \u0938\u0915\u0924\u093E \u0939\u0948\u0964",
+        questionsForDoctor: [
+          "\u092E\u0947\u0930\u0947 \u092B\u093E\u0938\u094D\u091F\u093F\u0902\u0917 \u092C\u094D\u0932\u0921 \u0936\u0941\u0917\u0930 \u0915\u093E \u0906\u0926\u0930\u094D\u0936 \u0932\u0915\u094D\u0937\u094D\u092F \u0915\u094D\u092F\u093E \u0939\u094B\u0928\u093E \u091A\u093E\u0939\u093F\u090F?",
+          "\u0915\u094D\u092F\u093E \u0905\u092D\u0940 \u0926\u0935\u093E \u0936\u0941\u0930\u0942 \u0915\u0930\u0928\u0947 \u0915\u0940 \u0906\u0935\u0936\u094D\u092F\u0915\u0924\u093E \u0939\u0948 \u092F\u093E \u0915\u0947\u0935\u0932 \u0906\u0939\u093E\u0930 \u0928\u093F\u092F\u0902\u0924\u094D\u0930\u0923?",
+          "\u0926\u094B\u092C\u093E\u0930\u093E \u091F\u0947\u0938\u094D\u091F \u0915\u092C \u0915\u0930\u093E\u0928\u093E \u091A\u093E\u0939\u093F\u090F?"
+        ],
+        lifestyleGuidance: [
+          "\u092D\u094B\u091C\u0928 \u0915\u0947 \u092C\u093E\u0926 15 \u092E\u093F\u0928\u091F \u0915\u0940 \u0939\u0932\u094D\u0915\u0940 \u0938\u0948\u0930 \u091C\u0930\u0942\u0930 \u0915\u0930\u0947\u0902\u0964",
+          "\u092E\u0940\u0920\u0947 \u092A\u0947\u092F \u092A\u0926\u093E\u0930\u094D\u0925\u094B\u0902 \u0914\u0930 \u0930\u093F\u092B\u093E\u0907\u0902\u0921 \u0915\u093E\u0930\u094D\u092C\u094D\u0938 \u0938\u0947 \u092A\u0930\u0939\u0947\u091C \u0915\u0930\u0947\u0902\u0964"
+        ],
+        disclaimer: "\u092F\u0939 \u0930\u093F\u092A\u094B\u0930\u094D\u091F \u0915\u0947\u0935\u0932 \u0936\u0948\u0915\u094D\u0937\u093F\u0915 \u091C\u093E\u0928\u0915\u093E\u0930\u0940 \u0939\u0947\u0924\u0941 \u0939\u0948\u0964 \u0905\u092A\u0928\u0947 \u0921\u0949\u0915\u094D\u091F\u0930 \u0938\u0947 \u092A\u0930\u093E\u092E\u0930\u094D\u0936 \u0905\u0935\u0936\u094D\u092F \u0932\u0947\u0902\u0964"
+      };
+    }
+    if (lang === "ta") {
+      return {
+        title: "\u0B87\u0BB0\u0BA4\u0BCD\u0BA4 \u0B9A\u0BB0\u0BCD\u0B95\u0BCD\u0B95\u0BB0\u0BC8 \u0BAE\u0BB1\u0BCD\u0BB1\u0BC1\u0BAE\u0BCD \u0BA8\u0BC0\u0BB0\u0BBF\u0BB4\u0BBF\u0BB5\u0BC1 \u0BAE\u0BA4\u0BBF\u0BAA\u0BCD\u0BAA\u0BC0\u0B9F\u0BC1",
+        summary: "\u0B89\u0B99\u0BCD\u0B95\u0BB3\u0BCD \u0B86\u0BAF\u0BCD\u0BB5\u0B95 \u0B85\u0BB1\u0BBF\u0B95\u0BCD\u0B95\u0BC8\u0BAF\u0BBF\u0BB2\u0BCD \u0B95\u0BC1\u0BB3\u0BC1\u0B95\u0BCD\u0B95\u0BCB\u0BB8\u0BCD \u0BAE\u0BB1\u0BCD\u0BB1\u0BC1\u0BAE\u0BCD HbA1c \u0B85\u0BB3\u0BB5\u0BC1\u0B95\u0BB3\u0BCD \u0BAA\u0BB0\u0BBF\u0BA8\u0BCD\u0BA4\u0BC1\u0BB0\u0BC8\u0B95\u0BCD\u0B95\u0BAA\u0BCD\u0BAA\u0B9F\u0BCD\u0B9F \u0BB5\u0BB0\u0BAE\u0BCD\u0BAA\u0BC8 \u0BB5\u0BBF\u0B9F \u0B85\u0BA4\u0BBF\u0B95\u0BAE\u0BBE\u0B95 \u0B89\u0BB3\u0BCD\u0BB3\u0BA9.",
+        symptom: "\u0B87\u0BB0\u0BA4\u0BCD\u0BA4\u0BA4\u0BCD\u0BA4\u0BBF\u0BB2\u0BCD \u0B85\u0BA4\u0BBF\u0B95 \u0B9A\u0BB0\u0BCD\u0B95\u0BCD\u0B95\u0BB0\u0BC8 / \u0BA8\u0BC0\u0BB0\u0BBF\u0BB4\u0BBF\u0BB5\u0BC1",
+        category: "Metabolic",
+        severity: "high",
+        confidenceScore: 0.97,
+        keyFindings: [
+          { parameter: "Fasting Blood Glucose", value: "178.0 mg/dL", referenceRange: "70 - 99 mg/dL", status: "Elevated", interpretation: "\u0B87\u0BAF\u0BB2\u0BCD\u0BAA\u0BBE\u0BA9 \u0B85\u0BB3\u0BB5\u0BC8 \u0BB5\u0BBF\u0B9F \u0B95\u0BC2\u0B9F\u0BC1\u0BA4\u0BB2\u0BCD \u0B9A\u0BB0\u0BCD\u0B95\u0BCD\u0B95\u0BB0\u0BC8." },
+          { parameter: "HbA1c (Glycated Hemoglobin)", value: "8.6%", referenceRange: "< 5.7%", status: "Elevated", interpretation: "\u0B95\u0B9F\u0BA8\u0BCD\u0BA4 3 \u0BAE\u0BBE\u0BA4\u0B99\u0BCD\u0B95\u0BB3\u0BBF\u0BA9\u0BCD \u0B9A\u0BB0\u0BBE\u0B9A\u0BB0\u0BBF \u0B9A\u0BB0\u0BCD\u0B95\u0BCD\u0B95\u0BB0\u0BC8 \u0B89\u0BAF\u0BB0\u0BCD\u0BB5\u0BC1." }
+        ],
+        whatItMeans: "\u0B87\u0BB0\u0BA4\u0BCD\u0BA4\u0BA4\u0BCD\u0BA4\u0BBF\u0BB2\u0BCD \u0B9A\u0BB0\u0BCD\u0B95\u0BCD\u0B95\u0BB0\u0BC8 \u0B85\u0BB3\u0BB5\u0BC1 \u0B85\u0BA4\u0BBF\u0B95\u0BB0\u0BBF\u0B95\u0BCD\u0B95\u0BC1\u0BAE\u0BCD \u0BAA\u0BCB\u0BA4\u0BC1 \u0B89\u0B9F\u0BB2\u0BCD \u0B8E\u0BB3\u0BBF\u0BA4\u0BBF\u0BB2\u0BCD \u0B9A\u0BCB\u0BB0\u0BCD\u0BB5\u0B9F\u0BC8\u0BAF\u0BC1\u0BAE\u0BCD. \u0B9A\u0BB0\u0BBF\u0BAF\u0BBE\u0BA9 \u0B89\u0BA3\u0BB5\u0BC1 \u0BAE\u0BB1\u0BCD\u0BB1\u0BC1\u0BAE\u0BCD \u0B89\u0B9F\u0BB1\u0BCD\u0BAA\u0BAF\u0BBF\u0BB1\u0BCD\u0B9A\u0BBF \u0BAE\u0BC2\u0BB2\u0BAE\u0BCD \u0B87\u0BA4\u0BA9\u0BC8 \u0B95\u0B9F\u0BCD\u0B9F\u0BC1\u0BAA\u0BCD\u0BAA\u0B9F\u0BC1\u0BA4\u0BCD\u0BA4\u0BB2\u0BBE\u0BAE\u0BCD.",
+        questionsForDoctor: [
+          "\u0B8E\u0BA9\u0BA4\u0BC1 \u0B87\u0BB0\u0BA4\u0BCD\u0BA4 \u0B9A\u0BB0\u0BCD\u0B95\u0BCD\u0B95\u0BB0\u0BC8 \u0B87\u0BB2\u0B95\u0BCD\u0B95\u0BC1 \u0B8E\u0BA9\u0BCD\u0BA9\u0BB5\u0BBE\u0B95 \u0B87\u0BB0\u0BC1\u0B95\u0BCD\u0B95 \u0BB5\u0BC7\u0BA3\u0BCD\u0B9F\u0BC1\u0BAE\u0BCD?",
+          "\u0B89\u0BA3\u0BB5\u0BC1 \u0BAE\u0BC1\u0BB1\u0BC8 \u0BAE\u0BB1\u0BCD\u0BB1\u0BC1\u0BAE\u0BCD \u0BAE\u0BB0\u0BC1\u0BA8\u0BCD\u0BA4\u0BC1 \u0BAA\u0BB0\u0BBF\u0BA8\u0BCD\u0BA4\u0BC1\u0BB0\u0BC8\u0B95\u0BB3\u0BCD \u0B8E\u0BA9\u0BCD\u0BA9?"
+        ],
+        lifestyleGuidance: [
+          "\u0B89\u0BA3\u0BB5\u0BC1\u0B95\u0BCD\u0B95\u0BC1\u0BAA\u0BCD \u0BAA\u0BBF\u0BB1\u0B95\u0BC1 15 \u0BA8\u0BBF\u0BAE\u0BBF\u0B9F\u0B99\u0BCD\u0B95\u0BB3\u0BCD \u0BA8\u0B9F\u0BC8\u0BAA\u0BCD\u0BAA\u0BAF\u0BBF\u0BB1\u0BCD\u0B9A\u0BBF \u0B9A\u0BC6\u0BAF\u0BCD\u0BAF\u0BC1\u0B99\u0BCD\u0B95\u0BB3\u0BCD.",
+          "\u0BA8\u0BBE\u0BB0\u0BCD\u0B9A\u0BCD\u0B9A\u0BA4\u0BCD\u0BA4\u0BC1 \u0BA8\u0BBF\u0BB1\u0BC8\u0BA8\u0BCD\u0BA4 \u0B95\u0BBE\u0BAF\u0BCD\u0B95\u0BB1\u0BBF\u0B95\u0BB3\u0BC8 \u0B89\u0BA3\u0BB5\u0BBF\u0BB2\u0BCD \u0B9A\u0BC7\u0BB0\u0BCD\u0BA4\u0BCD\u0BA4\u0BC1\u0B95\u0BCD \u0B95\u0BCA\u0BB3\u0BCD\u0BB3\u0BC1\u0B99\u0BCD\u0B95\u0BB3\u0BCD."
+        ],
+        disclaimer: "\u0B87\u0BA4\u0BC1 \u0BAE\u0BB0\u0BC1\u0BA4\u0BCD\u0BA4\u0BC1\u0BB5 \u0B86\u0BB2\u0BCB\u0B9A\u0BA9\u0BC8 \u0B85\u0BB2\u0BCD\u0BB2. \u0BAE\u0BB0\u0BC1\u0BA4\u0BCD\u0BA4\u0BC1\u0BB5\u0BB0\u0BC8 \u0B85\u0BA3\u0BC1\u0B95\u0BB5\u0BC1\u0BAE\u0BCD."
+      };
+    }
     return {
       title: "Glycemic Profile & Diabetes Evaluation",
       summary: "Your report indicates elevated blood glucose and glycated hemoglobin (HbA1c) levels. This suggests your body is having trouble processing sugars efficiently, typical of insulin resistance or type-2 diabetes.",
@@ -550,285 +917,45 @@ function generateFallbackMedicalAnalysis(base64Str, pincode) {
       confidenceScore: 0.97,
       keyFindings: [
         { parameter: "Fasting Blood Glucose", value: "178.0 mg/dL", referenceRange: "70 - 99 mg/dL", status: "Elevated", interpretation: "Significantly higher than optimal fasting baseline." },
-        { parameter: "HbA1c (Glycated Hemoglobin)", value: "8.6%", referenceRange: "< 5.7%", status: "Elevated", interpretation: "Reflects elevated average blood sugar over the last 3 months." },
-        { parameter: "Serum Creatinine", value: "0.92 mg/dL", referenceRange: "0.7 - 1.2 mg/dL", status: "Normal", interpretation: "Kidney filtration function remains in the healthy range." },
-        { parameter: "Microalbumin / Creatinine Ratio", value: "38.5 mg/g", referenceRange: "< 30 mg/g", status: "Elevated", interpretation: "Slight trace protein, an early sign to protect kidney wellness." }
+        { parameter: "HbA1c (Glycated Hemoglobin)", value: "8.6%", referenceRange: "< 5.7%", status: "Elevated", interpretation: "Reflects elevated average blood sugar over the last 3 months." }
       ],
-      whatItMeans: "When glucose stays elevated, sugar remains in your bloodstream instead of fueling your cells. You might experience fatigue, increased thirst, or frequent urination. The great news is that blood sugar responds very effectively to guided nutrition, physical activity, and medical support.",
+      whatItMeans: "When glucose stays elevated, sugar remains in your bloodstream instead of fueling your cells. You might experience fatigue, increased thirst, or frequent urination.",
       questionsForDoctor: [
         "What target range should I aim for with my fasting blood sugar?",
         "Should we initiate medication or focus on medical nutrition therapy first?",
-        "How often should we repeat my HbA1c to monitor progress?",
-        "Do you recommend a continuous glucose monitor (CGM) or fingerstick tests?"
+        "How often should we repeat my HbA1c to monitor progress?"
       ],
       lifestyleGuidance: [
         "Incorporate a 15-minute gentle walk immediately after meals to facilitate glucose uptake.",
-        "Emphasize whole fiber, leafy greens, and lean proteins while minimizing refined carbohydrates and sodas.",
-        "Stay well-hydrated throughout the day with filtered water.",
-        "Ensure 7 to 8 hours of consistent, restful sleep to help balance cortisol and insulin."
+        "Emphasize whole fiber, leafy greens, and lean proteins while minimizing refined carbohydrates.",
+        "Stay well-hydrated throughout the day with filtered water."
       ],
       disclaimer: "This report summary is educational and does not constitute a formal prescription or diagnosis. Please consult your physician."
     };
   }
-  if (isLiver) {
-    return {
-      title: "Hepatic Function & Liver Enzyme Panel",
-      summary: "Your liver enzymes (ALT and AST) are markedly elevated above the standard range. This signifies active liver inflammation or cell irritation that requires prompt medical evaluation.",
-      symptom: "Acute Hepatocellular Injury / High Transaminases",
-      category: "Hepatic",
-      severity: "critical",
-      confidenceScore: 0.96,
-      keyFindings: [
-        { parameter: "ALT (SGPT)", value: "340.0 U/L", referenceRange: "5 - 45 U/L", status: "Critical", interpretation: "High enzyme release into blood reflecting liver strain." },
-        { parameter: "AST (SGOT)", value: "295.0 U/L", referenceRange: "5 - 35 U/L", status: "Critical", interpretation: "Supports hepatocellular inflammation." },
-        { parameter: "Total Bilirubin", value: "3.2 mg/dL", referenceRange: "0.2 - 1.2 mg/dL", status: "Elevated", interpretation: "Bile pigment retention, may cause mild jaundice or fatigue." },
-        { parameter: "Serum Albumin", value: "3.9 g/dL", referenceRange: "3.5 - 5.0 g/dL", status: "Normal", interpretation: "Liver synthetic protein capacity is currently preserved." }
-      ],
-      whatItMeans: "The liver is remarkably resilient and can regenerate rapidly once the underlying irritation (such as a viral infection, medication reaction, or fatty accumulation) is addressed with a physician.",
-      questionsForDoctor: [
-        "Do we need a viral hepatitis screen or abdominal ultrasound?",
-        "Are any of my current medications or supplements straining my liver?",
-        "When should we re-check these enzyme levels to confirm recovery?"
-      ],
-      lifestyleGuidance: [
-        "Strictly avoid all alcohol consumption until enzymes normalize.",
-        "Avoid over-the-counter pain relievers (especially acetaminophen/paracetamol) unless prescribed.",
-        "Maintain a light, easily digestible diet rich in antioxidants."
-      ],
-      disclaimer: "This educational report should be reviewed immediately with your gastroenterologist or primary care physician."
-    };
-  }
-  if (isCbc) {
-    return {
-      title: "Complete Blood Count & Inflammatory Screen",
-      summary: "Your white blood cell count and neutrophils are significantly elevated, which is your immune system's standard response when fighting off an active infection or inflammation.",
-      symptom: "Leukocytosis / Acute Bacterial Infection",
-      category: "Hematology",
-      severity: "high",
-      confidenceScore: 0.95,
-      keyFindings: [
-        { parameter: "White Blood Cells (WBC)", value: "16,800 /\u03BCL", referenceRange: "4,000 - 11,000", status: "Elevated", interpretation: "Immune defense mobilization against an infection." },
-        { parameter: "Neutrophils", value: "82.0%", referenceRange: "40 - 70%", status: "Elevated", interpretation: "Left-shift typical of bacterial defense." },
-        { parameter: "Hemoglobin", value: "13.8 g/dL", referenceRange: "13.0 - 17.0", status: "Normal", interpretation: "Healthy oxygen-carrying capacity." },
-        { parameter: "C-Reactive Protein (CRP)", value: "24.6 mg/L", referenceRange: "< 3.0", status: "Elevated", interpretation: "Confirmative marker of systemic inflammatory response." }
-      ],
-      whatItMeans: "Your body is actively defending itself. If you have symptoms like fever, chills, sore throat, or localized pain, this lab clarifies why your body feels fatigued.",
-      questionsForDoctor: [
-        "Do these results warrant a course of antibiotics or supportive antiviral care?",
-        "Should we perform a culture (throat, urine, or sputum) to identify the pathogen?",
-        "What warning signs should prompt me to seek urgent care?"
-      ],
-      lifestyleGuidance: [
-        "Prioritize complete bed rest and allow your immune system to focus energy on healing.",
-        "Drink warm fluids, soups, and electrolyte solutions.",
-        "Monitor your body temperature twice daily."
-      ],
-      disclaimer: "Please present this report to your physician for appropriate antimicrobial or symptomatic treatment."
-    };
-  }
   return {
     title: "Cardiovascular Lipid & Metabolic Profile",
-    summary: "Your lipid profile reveals elevated levels of total cholesterol and LDL ('bad') cholesterol. While your protective HDL is slightly low, proactive dietary and lifestyle steps can make a dramatic positive difference.",
+    summary: "Your lipid profile reveals elevated levels of total cholesterol and LDL ('bad') cholesterol. Proactive dietary and lifestyle steps can make a dramatic positive difference.",
     symptom: "Hypercholesterolemia / High Atherogenic Risk",
     category: "Cardiovascular",
     severity: "moderate",
     confidenceScore: 0.93,
     keyFindings: [
       { parameter: "Total Cholesterol", value: "264.0 mg/dL", referenceRange: "< 200 mg/dL", status: "Elevated", interpretation: "Above recommended threshold for optimal arterial health." },
-      { parameter: "LDL ('Bad') Cholesterol", value: "182.0 mg/dL", referenceRange: "< 100 mg/dL", status: "Elevated", interpretation: "Primary target for cardiovascular risk reduction." },
-      { parameter: "HDL ('Good') Cholesterol", value: "36.0 mg/dL", referenceRange: "> 40 mg/dL", status: "Low", interpretation: "Lower protective HDL level, can be boosted with exercise." },
-      { parameter: "Triglycerides", value: "215.0 mg/dL", referenceRange: "< 150 mg/dL", status: "Elevated", interpretation: "Circulating blood fats influenced by refined sugars and starches." }
+      { parameter: "LDL ('Bad') Cholesterol", value: "182.0 mg/dL", referenceRange: "< 100 mg/dL", status: "Elevated", interpretation: "Primary target for cardiovascular risk reduction." }
     ],
-    whatItMeans: "Elevated LDL cholesterol can slowly deposit along blood vessel walls over time. The encouraging fact is that cholesterol metrics respond promptly to heart-healthy fats, soluble fiber, and regular cardiovascular exercise.",
+    whatItMeans: "Elevated LDL cholesterol can slowly deposit along blood vessel walls. The encouraging fact is that cholesterol metrics respond promptly to heart-healthy fats, soluble fiber, and regular cardiovascular exercise.",
     questionsForDoctor: [
       "What is my overall 10-year cardiovascular risk score?",
-      "Would a low-dose lipid-lowering medication (statin) be beneficial for me?",
       "Can we trial 3 months of focused dietary changes before deciding on medication?"
     ],
     lifestyleGuidance: [
       "Incorporate soluble fiber such as steel-cut oats, chia seeds, and legumes daily.",
-      "Replace saturated butter and palm oils with extra-virgin olive oil and nuts.",
-      "Engage in 30 minutes of moderate aerobic activity (brisk walking, cycling) 5 days a week."
+      "Engage in 30 minutes of moderate aerobic activity 5 days a week."
     ],
     disclaimer: "Educational analysis only. Please discuss with your cardiologist or primary care doctor."
   };
 }
-apiApp.post("/api/symptom-chat", async (req, res) => {
-  try {
-    const { message, history = [], reportContext, pincode } = req.body;
-    if (!message || typeof message !== "string") {
-      res.status(400).json({ error: "A message describing your symptoms or feelings is required." });
-      return;
-    }
-    const ai = getGeminiClient();
-    let replyText = "";
-    let extractedSymptom = "";
-    let extractedSeverity = "moderate";
-    let extractedCategory = "General Health";
-    let contextPrompt = "";
-    if (reportContext) {
-      contextPrompt = `
-PATIENT RECENT LAB REPORT CONTEXT:
-- Test: ${reportContext.title || "Laboratory Panel"}
-- Key Findings: ${JSON.stringify(reportContext.keyFindings || [])}
-- Overall Translation: ${reportContext.summary || ""}
-- Extracted Symptom: ${reportContext.symptom || ""}
-If the patient's symptoms relate to these laboratory results, explicitly correlate their physical feelings with these specific biomarkers!
-`;
-    }
-    if (ai) {
-      try {
-        const systemInstruction = `You are Sentinel Health's compassionate Clinical Health Educator and Symptom Assistant.
-Your mission is to listen to the user describing how they feel physically, validate their experience with empathy, explain what might be happening physiologically in clear, accessible plain language, and help them prepare for a clinical visit.
-
-Follow this structure in your response:
-1. **Empathy & Validation**: Acknowledge how they are feeling in a comforting, professional manner.
-2. **What Might Be Happening**: Provide 2-3 plausible physiological explanations in simple, everyday language (e.g., how dehydration, blood sugar fluctuations, viral responses, or electrolyte shifts affect the body). Always frame these as possibilities to explore, not definitive diagnoses.
-3. **Lab Correlation**: If lab report context is provided, connect their symptoms directly to their lab values.
-4. **When to Seek Immediate Care (Red Flags)**: List 2-3 specific emergency signs that mean they should go to urgent care or the ER immediately.
-5. **Practical At-Home Comfort Measures**: Safe, non-pharmacological comfort steps (hydration, rest, gentle movement, dietary adjustments).
-6. **Questions for Your Doctor**: 2-3 concise questions to ask at their next appointment.
-
-At the very end of your response, on a new line, include a hidden extraction block formatted exactly like:
-<!--EXTRACT:{"symptom":"Short Symptom Keyword (3-6 words)","severity":"low|moderate|high|critical","category":"Metabolic|Hematology|Cardiovascular|Hepatic|Immunology|General"}-->
-`;
-        const formattedContents = [];
-        for (const item of history.slice(-6)) {
-          formattedContents.push({
-            role: item.role === "model" ? "model" : "user",
-            parts: [{ text: item.text }]
-          });
-        }
-        const userPrompt = `${contextPrompt}
-
-PATIENT STATES:
-"${message}"`;
-        formattedContents.push({
-          role: "user",
-          parts: [{ text: userPrompt }]
-        });
-        const response = await ai.models.generateContent({
-          model: "gemini-3.8-flash",
-          contents: formattedContents,
-          config: {
-            systemInstruction,
-            temperature: 0.7
-          }
-        });
-        const rawReply = response.text || "";
-        const match = rawReply.match(/<!--EXTRACT:(.*?)-->/);
-        if (match) {
-          try {
-            const parsed = JSON.parse(match[1]);
-            extractedSymptom = parsed.symptom || "";
-            extractedSeverity = parsed.severity || "moderate";
-            extractedCategory = parsed.category || "General Health";
-          } catch {
-          }
-          replyText = rawReply.replace(/<!--EXTRACT:(.*?)-->/, "").trim();
-        } else {
-          replyText = rawReply.trim();
-        }
-      } catch (geminiErr) {
-        console.warn("Gemini chat error, using clinical fallback:", geminiErr);
-      }
-    }
-    if (!replyText) {
-      const lower = message.toLowerCase();
-      if (lower.includes("tired") || lower.includes("fatigue") || lower.includes("exhausted") || lower.includes("dizzy")) {
-        extractedSymptom = "Fatigue / Lethargy & Dizziness";
-        extractedSeverity = "moderate";
-        extractedCategory = "Metabolic";
-        replyText = `I understand how draining constant fatigue and dizziness can feel. When your energy drops suddenly or persists over days, your body is communicating that its cellular fuel or oxygen delivery may be constrained.
-
-### What Might Be Happening
-- **Cellular Energy / Glycemic Imbalance**: Blood sugar swings (either drops after high-carb meals or sustained highs where glucose cannot enter cells) can starve muscles and brain tissue of ready fuel.
-- **Oxygen Transport**: Low hemoglobin or iron reserves (anemia) directly reduces oxygen delivery to vital tissues, leading to brain fog and heavy limbs.
-- **Hydration & Electrolytes**: Even mild dehydration (or low sodium/potassium) reduces circulating blood volume, leading to lightheadedness upon standing.
-
-### Practical Comfort Steps
-1. Sip water with electrolytes or coconut water throughout the day.
-2. Avoid skipping meals; include protein with complex carbohydrates.
-3. Rest with legs slightly elevated if dizziness occurs.
-
-### Red Flag Symptoms
-Seek prompt medical care if you experience chest tightness, fainting (syncope), sudden weakness on one side, or shortness of breath at rest.
-
-### Questions for Your Doctor
-- "Should we check my complete blood count (CBC), iron panel, and thyroid levels?"
-- "Could my current medications or sleep quality be contributing to this fatigue?"`;
-      } else if (lower.includes("stomach") || lower.includes("nausea") || lower.includes("pain") || lower.includes("digest")) {
-        extractedSymptom = "Gastric Discomfort / Nausea";
-        extractedSeverity = "moderate";
-        extractedCategory = "Hepatic";
-        replyText = `Dealing with stomach discomfort and nausea is very uncomfortable. Your gastrointestinal tract is lined with sensitive nerve endings and immune cells that react quickly to irritation or dietary stress.
-
-### What Might Be Happening
-- **Gastric Acidity or Mucosal Irritation**: Increased stomach acid production or gastritis can cause a gnawing, burning sensation.
-- **Biliary or Liver Strain**: Sluggish bile flow or elevated liver transaminases can make digesting rich foods or fats trigger nausea.
-- **Gut Motility Response**: Stress or mild gastrointestinal infection can alter peristalsis, causing cramping and queasiness.
-
-### Practical Comfort Steps
-1. Eat small, bland meals (crackers, oats, bananas, boiled rice) rather than large portions.
-2. Avoid caffeine, alcohol, acidic citrus, and spicy or greasy foods.
-3. Sip warm ginger or chamomile tea.
-
-### Red Flag Symptoms
-Seek emergency medical evaluation if you vomit blood, have black tarry stools, experience sudden excruciating abdominal pain, or cannot keep liquids down for over 12 hours.
-
-### Questions for Your Doctor
-- "Do you recommend testing for H. pylori or evaluating my liver and gallbladder function?"
-- "Would an acid reducer or probiotic be appropriate for me?"`;
-      } else {
-        extractedSymptom = "General Somatic Discomfort";
-        extractedSeverity = "low";
-        extractedCategory = "General Health";
-        replyText = `Thank you for sharing how you are feeling. Physical symptoms are often interconnected signals from your body asking for rest, nutritional balance, or clinical evaluation.
-
-### What Might Be Happening
-- **Immune or Inflammatory Activation**: Mild systemic inflammation, early viral defense, or stress can produce aches, mild malaise, or temperature changes.
-- **Metabolic Strain**: Changes in physical activity, hydration, or sleep hygiene directly impact how your nervous and cardiovascular systems regulate sensations.
-
-### Comfort Recommendations
-- Stay well hydrated and aim for 8 hours of restorative rest.
-- Keep a brief daily symptom log noting what times of day symptoms peak.
-
-### Red Flag Signs
-Seek immediate emergency medical care if you develop high fever, difficulty breathing, chest pressure, severe unrelenting pain, or confusion.
-
-*Disclaimer: This is educational guidance powered by Sentinel Health AI and does not replace professional medical evaluation.*`;
-      }
-    }
-    let savedDocId = null;
-    if (pincode && pincode.length === 6 && extractedSymptom) {
-      const loc = getPincodeLocation(pincode);
-      savedDocId = await saveToFirestoreRest({
-        pincode,
-        symptom: extractedSymptom,
-        category: extractedCategory,
-        severity: extractedSeverity,
-        lat: loc.lat,
-        lng: loc.lng,
-        regionName: `${loc.city}, ${loc.state}`,
-        confidenceScore: 0.95,
-        createdAt: (/* @__PURE__ */ new Date()).toISOString()
-      });
-    }
-    res.json({
-      reply: replyText,
-      extractedSymptom,
-      severity: extractedSeverity,
-      category: extractedCategory,
-      savedDocId
-    });
-  } catch (error) {
-    console.error("Error in /api/symptom-chat:", error);
-    res.status(500).json({
-      error: "An unexpected error occurred during symptom consultation.",
-      details: error.message
-    });
-  }
-});
 
 // server/serverImpl.ts
 dotenv.config();

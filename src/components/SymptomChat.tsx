@@ -16,6 +16,7 @@ import {
   FileText
 } from 'lucide-react';
 import { getPincodeLocation } from '../lib/pincodeData';
+import { scrubPiiFromText } from '../lib/piiScrubber';
 
 export interface ChatMessage {
   id: string;
@@ -28,6 +29,7 @@ export interface ChatMessage {
 
 interface SymptomChatProps {
   pincode: string;
+  targetLanguage?: string;
   reportContext?: {
     title: string;
     summary: string;
@@ -40,26 +42,34 @@ interface SymptomChatProps {
 
 export const SymptomChat: React.FC<SymptomChatProps> = ({
   pincode,
+  targetLanguage = 'en',
   reportContext,
   onNavigateToDashboard,
   onSwitchToScanner
 }) => {
-  const [messages, setMessages] = useState<ChatMessage[]>(() => [
-    {
-      id: 'welcome',
-      role: 'model',
-      text: `Hello! I'm your Sentinel Health Clinical Assistant.
-
-How are you feeling physically today? You can describe any sensations, discomfort, or changes you've noticed (such as dizziness, fatigue, aches, or nausea).
-
-I will help explain **what might be happening inside your body in plain English**, outline what to monitor, suggest questions for your doctor, and flag any warning signs.`,
-      timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+  const [messages, setMessages] = useState<ChatMessage[]>(() => {
+    let welcome = `Hello! I'm your Sentinel Health Clinical Assistant.\n\nHow are you feeling physically today? You can describe any sensations, discomfort, or changes you've noticed (such as dizziness, fatigue, aches, or nausea).\n\nI will help explain **what might be happening inside your body in plain English**, outline what to monitor, suggest questions for your doctor, and flag any warning signs.`;
+    if (targetLanguage === 'te') {
+      welcome = `నమస్కారం! నేను మీ సెంటినెల్ హెల్త్ క్లినికల్ అసిస్టెంట్‌ని.\n\nమీరు శారీరకంగా ఎలా భావిస్తున్నారో వివరించండి (ఉదా. భోజనం తర్వాత కళ్లు తిరగడం, నీరసం లేదా కడుపులో అసౌకర్యం). మీ శరీరంలో ఏమి జరుగుతుందో సరళమైన తెలుగులో వివరిస్తాను.`;
+    } else if (targetLanguage === 'hi') {
+      welcome = `नमस्ते! मैं आपका सेंटिनल हेल्थ क्लिनिकल सहायक हूँ।\n\nआज आप शारीरिक रूप से कैसा महसूस कर रहे हैं? (उदा. कमजोरी, भोजन के बाद चक्कर आना, थकान)। मैं सरल हिन्दी में समझाऊंगा कि आपके शरीर में क्या हो रहा है।`;
+    } else if (targetLanguage === 'ta') {
+      welcome = `வணக்கம்! நான் உங்கள் சென்டினல் ஹெல்த் மருத்துவ உதவியாளர்.\n\nஇன்று உங்கள் உடல்நிலை எப்படி இருக்கிறது? நீங்கள் உணரும் மாற்றங்களை விவரிக்கவும். எளிய தமிழில் உங்களுக்கு விளக்கம் தருகிறேன்.`;
     }
-  ]);
+    return [
+      {
+        id: 'welcome',
+        role: 'model',
+        text: welcome,
+        timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+      }
+    ];
+  });
 
   const [input, setInput] = useState<string>('');
   const [loading, setLoading] = useState<boolean>(false);
   const [playingId, setPlayingId] = useState<string | null>(null);
+  const [lastScrubbedCount, setLastScrubbedCount] = useState<number>(0);
 
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
@@ -79,13 +89,17 @@ I will help explain **what might be happening inside your body in plain English*
   }, []);
 
   const handleSend = async (textToSend?: string) => {
-    const query = (textToSend || input).trim();
-    if (!query || loading) return;
+    const rawQuery = (textToSend || input).trim();
+    if (!rawQuery || loading) return;
+
+    // Edge-side PII scrubbing on chat message
+    const { scrubbedText, redactedCount } = scrubPiiFromText(rawQuery);
+    setLastScrubbedCount(redactedCount);
 
     const userMsg: ChatMessage = {
       id: `user-${Date.now()}`,
       role: 'user',
-      text: query,
+      text: scrubbedText,
       timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
     };
 
@@ -103,10 +117,11 @@ I will help explain **what might be happening inside your body in plain English*
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          message: query,
+          message: scrubbedText,
           history: historyPayload,
           reportContext: reportContext || undefined,
-          pincode: pincode && pincode.length === 6 ? pincode : undefined
+          pincode: pincode && pincode.length === 6 ? pincode : undefined,
+          targetLanguage
         })
       });
 
