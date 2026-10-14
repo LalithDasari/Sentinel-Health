@@ -1,6 +1,4 @@
-import React, { useEffect, useRef, useState, useMemo } from 'react';
-import L from 'leaflet';
-import 'leaflet/dist/leaflet.css';
+import React, { useEffect, useState, useMemo, Suspense } from 'react';
 import {
   Search,
   PlusCircle,
@@ -22,6 +20,11 @@ import {
   saveSymptomReportToFirestore,
 } from '../lib/firebase';
 import { getPincodeLocation, SEED_SURVEILLANCE_REPORTS } from '../lib/pincodeData';
+import { MapSkeletonLoader } from './MapSkeletonLoader';
+import type { PincodeCluster, FocusTarget } from './SurveillanceMap';
+
+// Component Code Splitting: Dynamically import heavy Leaflet Surveillance Map
+const SurveillanceMap = React.lazy(() => import('./SurveillanceMap'));
 
 interface AdminDashboardProps {
   initialHighlightPincode?: string | null;
@@ -42,12 +45,12 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
   const [isSimulating, setIsSimulating] = useState<boolean>(false);
   const [isLiveCached, setIsLiveCached] = useState<boolean>(false);
   const [intensityMultiplier, setIntensityMultiplier] = useState<number>(1.2);
-
-  const mapContainerRef = useRef<HTMLDivElement>(null);
-  const mapInstanceRef = useRef<L.Map | null>(null);
-  const tileLayerRef = useRef<L.TileLayer | null>(null);
-  const markersLayerRef = useRef<L.LayerGroup | null>(null);
-  const heatCirclesLayerRef = useRef<L.LayerGroup | null>(null);
+  const [focusTarget, setFocusTarget] = useState<FocusTarget | null>(() => {
+    if (initialHighlightPincode) {
+      return { pincode: initialHighlightPincode, timestamp: Date.now(), zoom: 11 };
+    }
+    return null;
+  });
 
   // 1. Initial fast load from cached /api/signals route for instant rendering
   useEffect(() => {
@@ -81,6 +84,13 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
     };
   }, []);
 
+  // Update focus target when initialHighlightPincode prop changes
+  useEffect(() => {
+    if (initialHighlightPincode) {
+      setFocusTarget({ pincode: initialHighlightPincode, timestamp: Date.now(), zoom: 11 });
+    }
+  }, [initialHighlightPincode]);
+
   // Filtered reports for sidebar live feed
   const filteredReports = useMemo(() => {
     return reports.filter((item) => {
@@ -101,20 +111,8 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
   }, [reports, searchQuery, selectedCategory, selectedSeverity]);
 
   // Aggregate reports by Pincode for Dynamic Pulsing Heat Markers
-  const pincodeClusters = useMemo(() => {
-    const clusterMap: Record<
-      string,
-      {
-        pincode: string;
-        lat: number;
-        lng: number;
-        regionName: string;
-        reports: SymptomReportItem[];
-        dominantSymptom: string;
-        highestSeverity: 'low' | 'moderate' | 'high' | 'critical';
-        count: number;
-      }
-    > = {};
+  const pincodeClusters = useMemo<PincodeCluster[]>(() => {
+    const clusterMap: Record<string, PincodeCluster> = {};
 
     reports.forEach((item) => {
       const pin = item.pincode;
@@ -177,217 +175,10 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
     };
   }, [reports, pincodeClusters]);
 
-  // Initialize Leaflet Map
-  useEffect(() => {
-    const container = mapContainerRef.current;
-    if (!container) return;
-
-    if ((container as any)._leaflet_id) {
-      (container as any)._leaflet_id = null;
-    }
-
-    if (!mapInstanceRef.current) {
-      try {
-        const map = L.map(container, {
-          center: [21.5, 78.9629],
-          zoom: 5,
-          minZoom: 4,
-          maxZoom: 18,
-          zoomControl: false,
-          preferCanvas: true,
-        });
-
-        L.control.zoom({ position: 'bottomleft' }).addTo(map);
-
-        // OpenStreetMap Street View as standard default
-        const streetTileUrl = 'https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png';
-
-        const tileLayer = L.tileLayer(streetTileUrl, {
-          attribution:
-            '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors',
-          subdomains: 'abc',
-          maxZoom: 19,
-        });
-
-        tileLayer.addTo(map);
-        tileLayerRef.current = tileLayer;
-
-        const heatCirclesGroup = L.layerGroup().addTo(map);
-        const markersGroup = L.layerGroup().addTo(map);
-
-        markersLayerRef.current = markersGroup;
-        heatCirclesLayerRef.current = heatCirclesGroup;
-        mapInstanceRef.current = map;
-
-        requestAnimationFrame(() => map.invalidateSize());
-        setTimeout(() => map.invalidateSize(), 200);
-
-        const resizeObserver = new ResizeObserver(() => {
-          map.invalidateSize();
-        });
-        resizeObserver.observe(container);
-
-        return () => {
-          resizeObserver.disconnect();
-          if (mapInstanceRef.current) {
-            mapInstanceRef.current.remove();
-            mapInstanceRef.current = null;
-          }
-        };
-      } catch (err) {
-        console.error('Failed to initialize Leaflet map:', err);
-      }
-    }
-  }, []);
-
-  // Update Dynamic Pulsing Heat Markers on Map
-  useEffect(() => {
-    const map = mapInstanceRef.current;
-    const markersGroup = markersLayerRef.current;
-    const heatCirclesGroup = heatCirclesLayerRef.current;
-
-    if (!map || !markersGroup || !heatCirclesGroup) return;
-
-    markersGroup.clearLayers();
-    heatCirclesGroup.clearLayers();
-
-    pincodeClusters.forEach((cluster) => {
-      const { lat, lng, pincode, regionName, count, highestSeverity, reports } = cluster;
-
-      // Severity-scaled color, pulse animation class, and radius
-      let markerColor = '#0d9488'; // teal
-      let glowColor = 'rgba(13, 148, 136, 0.4)';
-      let heatFill = '#0d9488';
-      let pulseClass = 'pulse-moderate';
-      let ringRadiusMeters = (18000 + count * 3500) * intensityMultiplier;
-      let coreRadiusMeters = ringRadiusMeters * 0.35;
-      let opacityScale = 0.25;
-
-      if (highestSeverity === 'critical') {
-        markerColor = '#e11d48'; // crimson rose
-        glowColor = 'rgba(225, 29, 72, 0.6)';
-        heatFill = '#e11d48';
-        pulseClass = 'pulse-critical';
-        ringRadiusMeters = (38000 + count * 6000) * intensityMultiplier;
-        coreRadiusMeters = ringRadiusMeters * 0.45;
-        opacityScale = 0.45;
-      } else if (highestSeverity === 'high') {
-        markerColor = '#ea580c'; // fiery orange
-        glowColor = 'rgba(234, 88, 12, 0.5)';
-        heatFill = '#ea580c';
-        pulseClass = 'pulse-high';
-        ringRadiusMeters = (28000 + count * 4500) * intensityMultiplier;
-        coreRadiusMeters = ringRadiusMeters * 0.4;
-        opacityScale = 0.35;
-      } else if (highestSeverity === 'moderate') {
-        markerColor = '#d97706'; // amber
-        glowColor = 'rgba(217, 119, 6, 0.45)';
-        heatFill = '#d97706';
-        pulseClass = 'pulse-moderate';
-        ringRadiusMeters = (22000 + count * 4000) * intensityMultiplier;
-        coreRadiusMeters = ringRadiusMeters * 0.35;
-        opacityScale = 0.3;
-      }
-
-      // 1. Dynamic Outer Radial Radiation Zone
-      L.circle([lat, lng], {
-        radius: ringRadiusMeters,
-        color: heatFill,
-        weight: 1.5,
-        opacity: opacityScale * 0.7,
-        fillColor: heatFill,
-        fillOpacity: opacityScale * 0.3,
-      }).addTo(heatCirclesGroup);
-
-      // 2. High-Intensity Core Heat Zone
-      L.circle([lat, lng], {
-        radius: coreRadiusMeters,
-        color: heatFill,
-        weight: 2,
-        opacity: opacityScale,
-        fillColor: heatFill,
-        fillOpacity: opacityScale * 0.8,
-      }).addTo(heatCirclesGroup);
-
-      // 3. Dynamic Pulsing Radar Beacon DivIcon
-      const markerHtml = `
-        <div class="relative flex items-center justify-center cursor-pointer group" style="width: 36px; height: 36px;">
-          <div class="absolute inset-0 rounded-full ${pulseClass}" style="background-color: ${glowColor};"></div>
-          <div class="relative w-6 h-6 rounded-full flex items-center justify-center font-black text-[10px] text-white border-2 border-slate-900 shadow-xl transition transform group-hover:scale-125" style="background-color: ${markerColor};">
-            ${count}
-          </div>
-        </div>
-      `;
-
-      const customIcon = L.divIcon({
-        html: markerHtml,
-        className: 'sentinel-heat-marker',
-        iconSize: [36, 36],
-        iconAnchor: [18, 18],
-      });
-
-      const recentSymptomList = reports
-        .slice(0, 3)
-        .map(
-          (r) =>
-            `<li style="margin-bottom: 4px; display: flex; align-items: baseline; justify-content: space-between; font-size: 11px;">
-              <span style="font-weight: 600; color: #f8fafc;">${r.symptom}</span>
-              <span style="font-size: 9px; color: #94a3b8; margin-left: 6px; padding: 1px 4px; background: rgba(255,255,255,0.06); border-radius: 4px;">${r.category || ''}</span>
-            </li>`
-        )
-        .join('');
-
-      const popupHtml = `
-        <div style="font-family: system-ui, sans-serif; min-width: 220px; padding: 4px;">
-          <div style="display: flex; align-items: center; justify-content: space-between; margin-bottom: 6px;">
-            <span style="font-size: 11px; font-weight: 800; color: ${markerColor}; letter-spacing: 0.5px;">
-              PIN ${pincode}
-            </span>
-            <span style="font-size: 10px; font-weight: 700; color: #e2e8f0; background: rgba(255,255,255,0.1); padding: 1px 6px; border-radius: 999px;">
-              ${count} Report${count > 1 ? 's' : ''}
-            </span>
-          </div>
-          <h4 style="margin: 0 0 4px 0; font-size: 13px; font-weight: 700; color: #ffffff;">
-            ${regionName}
-          </h4>
-          <div style="font-size: 11px; margin-bottom: 8px; color: #cbd5e1; border-bottom: 1px solid rgba(255,255,255,0.1); padding-bottom: 6px;">
-            Surveillance Severity: <strong style="color: ${markerColor}; text-transform: capitalize;">${highestSeverity}</strong>
-          </div>
-          <p style="font-size: 10px; font-weight: 700; color: #94a3b8; text-transform: uppercase; margin: 0 0 4px 0;">
-            Extracted Clinical Findings:
-          </p>
-          <ul style="list-style: none; padding: 0; margin: 0;">
-            ${recentSymptomList}
-          </ul>
-        </div>
-      `;
-
-      const marker = L.marker([lat, lng], { icon: customIcon });
-      marker.bindPopup(popupHtml, { className: 'sentinel-dark-popup' });
-      marker.addTo(markersGroup);
-    });
-  }, [pincodeClusters, intensityMultiplier]);
-
-  // Handle initial highlight pincode zoom & focus
-  useEffect(() => {
-    if (!initialHighlightPincode || !mapInstanceRef.current) return;
-    const targetCluster = pincodeClusters.find((c) => c.pincode === initialHighlightPincode);
-    if (targetCluster) {
-      mapInstanceRef.current.flyTo([targetCluster.lat, targetCluster.lng], 11, {
-        duration: 1.2,
-      });
-    }
-  }, [initialHighlightPincode, pincodeClusters]);
-
   const handleFlyToPincode = (pincode: string, reportId?: string) => {
-    const target = pincodeClusters.find((c) => c.pincode === pincode);
-    if (target && mapInstanceRef.current) {
-      mapInstanceRef.current.flyTo([target.lat, target.lng], 11, {
-        duration: 1.2,
-      });
-      if (reportId) {
-        setActiveReportId(reportId);
-      }
+    setFocusTarget({ pincode, timestamp: Date.now(), zoom: 11 });
+    if (reportId) {
+      setActiveReportId(reportId);
     }
   };
 
@@ -463,8 +254,8 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
         isHighContrast ? 'bg-black text-white' : 'bg-slate-950 text-slate-100'
       }`}
     >
-      {/* Left Main Map Stage */}
-      <div className="flex-1 flex flex-col relative h-[55vh] lg:h-full border-b lg:border-b-0 lg:border-r border-slate-800">
+      {/* Left Main Map Stage with explicit min-height for LCP/CLS optimization */}
+      <div className="flex-1 flex flex-col relative h-[55vh] lg:h-full border-b lg:border-b-0 lg:border-r border-slate-800 min-h-[420px] w-full">
         {/* Top Surveillance KPI Ribbon */}
         <div className="bg-slate-900/90 backdrop-blur-md border-b border-slate-800 px-4 py-2.5 flex items-center justify-between flex-wrap gap-2 z-10">
           <div className="flex items-center gap-3">
@@ -516,6 +307,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
               step={0.1}
               value={intensityMultiplier}
               onChange={(e) => setIntensityMultiplier(parseFloat(e.target.value))}
+              aria-label="Adjust surveillance heatmap pulse intensity"
               className="w-full h-1.5 bg-slate-700 rounded-lg appearance-none cursor-pointer accent-teal-500"
             />
           </div>
@@ -536,7 +328,8 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
                 key={m.pin}
                 type="button"
                 onClick={() => handleFlyToPincode(m.pin)}
-                className="text-[10px] font-extrabold px-2 py-1 rounded bg-slate-800 hover:bg-teal-600 text-slate-200 hover:text-white transition"
+                aria-label={`Jump to ${m.label} hotspot PIN ${m.pin}`}
+                className="text-[10px] font-extrabold px-2 py-1 rounded bg-slate-800 hover:bg-teal-600 text-slate-200 hover:text-white transition focus-visible:ring-2 focus-visible:ring-teal-400"
               >
                 {m.label}
               </button>
@@ -544,8 +337,21 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
           </div>
         </div>
 
-        {/* Leaflet Map DOM Node */}
-        <div ref={mapContainerRef} className="w-full h-full relative z-0" />
+        {/* Dynamic Leaflet Map Area with Suspense and Zero-CLS Skeleton Loader */}
+        <div
+          className="w-full h-full relative z-0 min-h-[420px]"
+          style={{ minHeight: '420px', width: '100%', height: '100%' }}
+        >
+          <Suspense fallback={<MapSkeletonLoader isHighContrast={isHighContrast} />}>
+            <SurveillanceMap
+              clusters={pincodeClusters}
+              intensityMultiplier={intensityMultiplier}
+              focusTarget={focusTarget}
+              onClusterSelect={(pin) => handleFlyToPincode(pin)}
+              isHighContrast={isHighContrast}
+            />
+          </Suspense>
+        </div>
       </div>
 
       {/* Right Sidebar: Real-Time Epidemiological Symptom Feed */}
@@ -599,106 +405,99 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
               <option value="All">All Categories</option>
               <option value="Metabolic">Metabolic</option>
               <option value="Hematology">Hematology</option>
-              <option value="Cardiovascular">Cardiovascular</option>
               <option value="Hepatic">Hepatic</option>
+              <option value="Renal">Renal</option>
+              <option value="Cardiology">Cardiology</option>
+              <option value="General">General</option>
             </select>
           </div>
 
-          {/* Actions: Simulate Influx & Export */}
+          {/* Action Buttons: Simulate Signal & Export CSV */}
           <div className="flex items-center gap-2 pt-1">
             <button
               type="button"
               onClick={handleSimulateInflux}
               disabled={isSimulating}
-              className="flex-1 py-1.5 px-2.5 rounded-lg text-xs font-bold bg-teal-600 hover:bg-teal-500 text-white flex items-center justify-center gap-1.5 transition shadow-xs disabled:opacity-50"
+              className="flex-1 flex items-center justify-center gap-1.5 bg-gradient-to-r from-teal-600 to-emerald-600 hover:from-teal-500 hover:to-emerald-500 text-white font-extrabold text-xs py-1.5 px-3 rounded-lg shadow-md transition disabled:opacity-50"
             >
-              <PlusCircle className={`w-3.5 h-3.5 ${isSimulating ? 'animate-spin' : ''}`} />
-              <span>Simulate Incident</span>
+              <PlusCircle className="w-3.5 h-3.5" />
+              {isSimulating ? 'Injecting...' : 'Inject Signal'}
             </button>
-
             <button
               type="button"
               onClick={handleExportCSV}
-              className="py-1.5 px-3 rounded-lg text-xs font-bold bg-slate-800 hover:bg-slate-700 text-slate-300 flex items-center gap-1.5 transition"
+              className="flex items-center gap-1.5 bg-slate-800 hover:bg-slate-700 text-slate-200 text-xs font-bold py-1.5 px-3 rounded-lg border border-slate-700 transition"
+              title="Export Surveillance Data to CSV"
             >
               <Download className="w-3.5 h-3.5" />
-              <span>Export CSV</span>
+              CSV
             </button>
           </div>
         </div>
 
-        {/* Live Scrollable Feed */}
-        <div className="flex-1 overflow-y-auto divide-y divide-slate-800/80 p-2 space-y-1">
-          {filteredReports.map((report, idx) => {
-            const isCritical = report.severity === 'critical';
-            const isHigh = report.severity === 'high';
-            const isModerate = report.severity === 'moderate';
+        {/* Scrollable Feed List */}
+        <div className="flex-1 overflow-y-auto divide-y divide-slate-800/60 p-2 space-y-2">
+          {filteredReports.length === 0 ? (
+            <div className="p-8 text-center text-slate-500 text-xs">
+              No surveillance reports match your filters.
+            </div>
+          ) : (
+            filteredReports.map((report, idx) => {
+              const isSelected = activeReportId === report.id;
+              let severityBadge = 'bg-teal-950/70 text-teal-400 border-teal-800';
+              if (report.severity === 'critical') {
+                severityBadge = 'bg-rose-950/80 text-rose-300 border-rose-900';
+              } else if (report.severity === 'high') {
+                severityBadge = 'bg-orange-950/80 text-orange-300 border-orange-900';
+              } else if (report.severity === 'moderate') {
+                severityBadge = 'bg-amber-950/80 text-amber-300 border-amber-900';
+              }
 
-            return (
-              <div
-                key={report.id || idx}
-                onClick={() => handleFlyToPincode(report.pincode, report.id)}
-                className={`p-3 rounded-xl cursor-pointer transition border ${
-                  activeReportId === report.id
-                    ? 'bg-slate-800 border-teal-500 shadow-md'
-                    : 'bg-slate-950/60 border-slate-800/60 hover:bg-slate-800/70'
-                }`}
-              >
-                <div className="flex items-start justify-between gap-2">
-                  <div className="space-y-1 min-w-0">
-                    <div className="flex items-center gap-1.5">
-                      <span
-                        className={`h-2 w-2 rounded-full ${
-                          isCritical
-                            ? 'bg-rose-500 animate-ping'
-                            : isHigh
-                            ? 'bg-orange-500'
-                            : isModerate
-                            ? 'bg-amber-500'
-                            : 'bg-emerald-500'
-                        }`}
-                      />
-                      <span className="text-[11px] font-bold text-slate-400">
-                        PIN {report.pincode} &bull; {report.regionName}
-                      </span>
-                    </div>
-
-                    <p className="text-xs font-bold text-white leading-snug line-clamp-2">
-                      {report.symptom}
-                    </p>
+              return (
+                <div
+                  key={report.id || `rep-${idx}`}
+                  onClick={() => handleFlyToPincode(report.pincode, report.id)}
+                  className={`p-3 rounded-xl cursor-pointer transition border ${
+                    isSelected
+                      ? 'bg-slate-800/90 border-teal-500 shadow-lg'
+                      : 'bg-slate-950/60 border-slate-800 hover:bg-slate-800/40 hover:border-slate-700'
+                  }`}
+                >
+                  <div className="flex items-start justify-between gap-2 mb-1">
+                    <span className="text-[11px] font-mono font-bold text-teal-400">
+                      PIN {report.pincode}
+                    </span>
+                    <span
+                      className={`text-[9px] uppercase font-black px-2 py-0.5 rounded-full border ${severityBadge}`}
+                    >
+                      {report.severity || 'low'}
+                    </span>
                   </div>
 
-                  <span
-                    className={`text-[10px] font-black uppercase px-2 py-0.5 rounded-full flex-shrink-0 ${
-                      isCritical
-                        ? 'bg-rose-950 text-rose-300 border border-rose-800'
-                        : isHigh
-                        ? 'bg-orange-950 text-orange-300 border border-orange-800'
-                        : isModerate
-                        ? 'bg-amber-950 text-amber-300 border border-amber-800'
-                        : 'bg-teal-950 text-teal-300 border border-teal-800'
-                    }`}
-                  >
-                    {report.severity || 'low'}
-                  </span>
-                </div>
+                  <h4 className="text-xs font-bold text-white line-clamp-2 mb-1">
+                    {report.symptom}
+                  </h4>
 
-                <div className="flex items-center justify-between text-[10px] text-slate-500 mt-2">
-                  <span>{report.category || 'General'}</span>
-                  <span>
-                    {report.createdAt
-                      ? new Date(report.createdAt).toLocaleTimeString([], {
-                          hour: '2-digit',
-                          minute: '2-digit',
-                        })
-                      : 'Just now'}
-                  </span>
+                  <div className="flex items-center justify-between text-[10px] text-slate-400">
+                    <span className="truncate max-w-[160px]">{report.regionName}</span>
+                    <span className="flex items-center gap-1 font-mono">
+                      <Clock className="w-2.5 h-2.5" />
+                      {report.createdAt
+                        ? new Date(report.createdAt).toLocaleTimeString([], {
+                            hour: '2-digit',
+                            minute: '2-digit',
+                          })
+                        : 'Live'}
+                    </span>
+                  </div>
                 </div>
-              </div>
-            );
-          })}
+              );
+            })
+          )}
         </div>
       </div>
     </div>
   );
 };
+
+export default AdminDashboard;
