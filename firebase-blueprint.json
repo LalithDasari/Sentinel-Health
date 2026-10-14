@@ -1,0 +1,62 @@
+{
+  "entities": {
+    "SymptomReport": {
+      "title": "SymptomReport",
+      "description": "Anonymized lab report symptom and location report for epidemiological surveillance",
+      "type": "object",
+      "properties": {
+        "pincode": {
+          "type": "string",
+          "description": "6-digit postal code",
+          "minLength": 6,
+          "maxLength": 6,
+          "pattern": "^[0-9]{6}$"
+        },
+        "symptom": {
+          "type": "string",
+          "description": "Short extracted symptom keyword or medical finding",
+          "minLength": 1,
+          "maxLength": 120
+        },
+        "category": {
+          "type": "string",
+          "description": "Clinical category such as Hematology, Metabolic, Infection, etc.",
+          "maxLength": 60
+        },
+        "severity": {
+          "type": "string",
+          "description": "Severity level classification",
+          "enum": ["low", "moderate", "high", "critical"]
+        },
+        "lat": {
+          "type": "number",
+          "description": "Approximate latitude coordinate of pincode centroid"
+        },
+        "lng": {
+          "type": "number",
+          "description": "Approximate longitude coordinate of pincode centroid"
+        },
+        "regionName": {
+          "type": "string",
+          "description": "City or regional locality name associated with the pincode",
+          "maxLength": 100
+        },
+        "confidenceScore": {
+          "type": "number",
+          "description": "AI extraction confidence score from 0 to 1"
+        },
+        "createdAt": {
+          "type": "string",
+          "description": "ISO 8601 timestamp string representing when the report was analyzed"
+        }
+      },
+      "required": ["pincode", "symptom", "createdAt"]
+    }
+  },
+  "firestore": {
+    "/symptom_reports/{reportId}": {
+      "schema": "SymptomReport",
+      "description": "Collection of anonymized symptom reports for public health dashboard mapping"
+    }
+  }
+}

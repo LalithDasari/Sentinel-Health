@@ -1,0 +1,45 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // Helper functions
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function isValidId(id) {
+      return id is string && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function isValidReport(data) {
+      return data.keys().hasAll(['pincode', 'symptom', 'createdAt']) &&
+        data.keys().hasOnly(['pincode', 'symptom', 'category', 'severity', 'lat', 'lng', 'regionName', 'confidenceScore', 'createdAt']) &&
+        data.pincode is string &&
+        data.pincode.size() == 6 &&
+        data.pincode.matches('^[0-9]{6}$') &&
+        data.symptom is string &&
+        data.symptom.size() >= 1 &&
+        data.symptom.size() <= 120 &&
+        data.createdAt is string &&
+        data.createdAt.size() <= 40 &&
+        (!('category' in data) || (data.category is string && data.category.size() <= 60)) &&
+        (!('severity' in data) || (data.severity in ['low', 'moderate', 'high', 'critical'])) &&
+        (!('lat' in data) || (data.lat is number)) &&
+        (!('lng' in data) || (data.lng is number)) &&
+        (!('regionName' in data) || (data.regionName is string && data.regionName.size() <= 100)) &&
+        (!('confidenceScore' in data) || (data.confidenceScore is number));
+    }
+
+    // Default deny
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // Public health surveillance collection - read allowed for live epidemiological dashboard, append-only with strict validation
+    match /symptom_reports/{reportId} {
+      allow read: if true;
+      allow create: if isValidId(reportId) && isValidReport(incoming());
+      allow update, delete: if false;
+    }
+  }
+}

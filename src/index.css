@@ -1,0 +1,58 @@
+@import "tailwindcss";
+@import "leaflet/dist/leaflet.css";
+
+/* Ensure Leaflet Container fills its allocated space and renders cleanly */
+.leaflet-container {
+  width: 100% !important;
+  height: 100% !important;
+  background-color: #020617 !important;
+  font-family: inherit;
+}
+
+/* Leaflet Dark Mode Custom Popup Styling */
+.sentinel-dark-popup .leaflet-popup-content-wrapper {
+  background: #090d16 !important;
+  color: #f1f5f9 !important;
+  border: 1px solid #1e293b !important;
+  border-radius: 14px !important;
+  box-shadow: 0 20px 25px -5px rgba(0, 0, 0, 0.7), 0 8px 10px -6px rgba(0, 0, 0, 0.7) !important;
+  padding: 6px !important;
+}
+
+.sentinel-dark-popup .leaflet-popup-tip {
+  background: #090d16 !important;
+  border: 1px solid #1e293b !important;
+}
+
+.sentinel-dark-popup .leaflet-popup-close-button {
+  color: #94a3b8 !important;
+  padding: 6px 8px !important;
+}
+
+.sentinel-dark-popup .leaflet-popup-close-button:hover {
+  color: #f8fafc !important;
+}
+
+.sentinel-heat-marker {
+  background: transparent !important;
+  border: none !important;
+}
+
+/* Custom Scrollbar for dark mode feed */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background: rgba(148, 163, 184, 0.2);
+  border-radius: 4px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: rgba(148, 163, 184, 0.4);
+}
