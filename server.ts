@@ -1,28 +1,20 @@
-import express from 'express';
-import path from 'path';
-import { fileURLToPath } from 'url';
-import dotenv from 'dotenv';
-import { apiApp } from './server/apiApp';
+/**
+ * Sentinel Health Production Entry Point
+ * Satisfies Cloud Run startup command: node server.ts
+ */
 
-dotenv.config();
+import fs from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-const app = express();
-const PORT = process.env.PORT || 3000;
+const bundledPath = path.resolve(__dirname, 'server.bundle.js');
 
-// Mount backend API routes (/api/*)
-app.use(apiApp);
-
-// Production static assets & SPA fallback
-const distPath = path.resolve(__dirname, 'dist');
-app.use(express.static(distPath));
-
-app.get('*', (_req, res) => {
-  res.sendFile(path.resolve(distPath, 'index.html'));
-});
-
-app.listen(PORT, () => {
-  console.log(`Sentinel Health full-stack server running on http://localhost:${PORT}`);
-});
+if (fs.existsSync(bundledPath)) {
+  await import('./server.bundle.js');
+} else {
+  // In development, load server implementation
+  await import('./server/serverImpl.ts');
+}
